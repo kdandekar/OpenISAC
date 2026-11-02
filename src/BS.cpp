@@ -590,6 +590,8 @@ private:
         uint64_t raw_drops = 0;
         uint64_t frames_with_payload = 0;
         uint64_t packets_sent = 0;
+        uint64_t packets_encoded = 0;
+        uint64_t frames_total = 0;
     };
     std::vector<std::unique_ptr<OfdmaUserStream>> _ofdma_users;
     // Encode-side redirection for OFDMA (set by the single encode thread before
@@ -2091,6 +2093,12 @@ private:
             had_payload = true;
         }
         if (had_payload) ++us.frames_with_payload;
+        if (++us.frames_total % 868 == 0 && LOG_MOD_ON(Config)) {   // about every 4 s at 25 MS/s
+            LOG_RT_INFO_M(Config) << "[OFDMA] user " << us.user_id << ": frames=" << us.frames_total
+                         << " frames_with_payload=" << us.frames_with_payload << " packets_placed=" << us.packets_sent
+                         << " packets_encoded=" << us.packets_encoded << " encoded_queue=" << us.packets->size()
+                         << " raw_queue=" << us.raw->size() << " raw_drops=" << us.raw_drops;
+        }
         us.modulated_pool.resize(us.data_pool.size());
         auto* __restrict__ mod_ptr = us.modulated_pool.data();
         const auto* __restrict__ src = us.data_pool.data();
@@ -2182,6 +2190,7 @@ private:
                 _encode_target_queue = nullptr;
                 _encode_effective_re = 0;
                 up->raw->consumer_pop();
+                ++up->packets_encoded;
                 if (!ok) return;
                 accumulate_profile(profile);
             }
