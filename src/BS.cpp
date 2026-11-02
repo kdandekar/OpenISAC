@@ -15,6 +15,8 @@
 #include <cerrno>
 #include <cstring>
 #include <sys/socket.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -254,6 +256,7 @@ public:
             x = _payload_modulation.modulate(static_cast<unsigned>(_dist(_gen)));
         }
         _build_symbol_templates();
+        _build_ofdma_streams();
         LOG_G_INFO_M(Sensing) << "Payload resource grid: " << _data_resource_layout.payload_re_count
                      << " payload RE out of " << _data_resource_layout.non_pilot_re_count
                      << " non-sync/non-pilot RE per frame, "
@@ -444,6 +447,10 @@ public:
         if (udp_sock >= 0) {
             shutdown(udp_sock, SHUT_RDWR);
         }
+        for (auto& up : _ofdma_users) {
+            const int s = up->sock.load(std::memory_order_acquire);
+            if (s >= 0) shutdown(s, SHUT_RDWR);
+        }
 
         if (_mod_thread.joinable()) _mod_thread.join();
         if (_tx_thread.joinable()) _tx_thread.join();
@@ -457,6 +464,10 @@ public:
         }
         _raw_udp_buffer.clear();
         _data_packet_buffer.clear();
+        for (auto& up : _ofdma_users) {
+            if (up->raw) up->raw->clear();
+            if (up->packets) up->packets->clear();
+        }
         _circular_buffer.clear();
         _data_packet_ingest_ts.clear();
 
@@ -497,6 +508,7 @@ private:
     const DataResourceGridLayout _data_resource_layout;
     SymbolVector _symbol_templates;
     std::vector<int> _payload_subcarrier_indices_flat;
+
 
     // Pre-calculated symbol positions
     std::vector<size_t> _symbol_positions; 
@@ -557,6 +569,29 @@ private:
         int64_t ingest_ns{0};
     };
     SPSCRingBuffer<RawUdpPacket> _raw_udp_buffer{256}; // UDP recv -> LDPC encode intermediate buffer
+    // OFDMA: one downlink payload stream per user. Each stream has its own UDP
+    // input, raw and encoded packet queues, payload layout (this user's
+    // subcarriers only) and per-frame data pool. In single-user mode (the
+    // default) `_ofdma_users` is empty and the legacy members above are used.
+    struct OfdmaUserStream {
+        size_t user_id = 0;
+        int udp_port = 0;
+        std::atomic<int> sock{-1};
+        DataResourceGridLayout layout;
+        std::vector<int> subcarrier_indices_flat;   // payload RE -> FFT bin, rank order
+        std::unique_ptr<SPSCRingBuffer<AlignedIntVector>> packets;
+        std::unique_ptr<SPSCRingBuffer<RawUdpPacket>> raw;
+        AlignedIntVector data_pool;
+        AlignedVector modulated_pool;
+        uint64_t raw_drops = 0;
+        uint64_t frames_with_payload = 0;
+        uint64_t packets_sent = 0;
+    };
+    std::vector<std::unique_ptr<OfdmaUserStream>> _ofdma_users;
+    // Encode-side redirection for OFDMA (set by the single encode thread before
+    // each _encode_and_enqueue_payload call; null = legacy queue/capacity).
+    SPSCRingBuffer<AlignedIntVector>* _encode_target_queue = nullptr;
+    size_t _encode_effective_re = 0;
     std::thread _udp_recv_thread; // UDP recv thread (separate from LDPC encode)
     struct PktTimestamps { int64_t ingest_ns{0}; int64_t encoded_ns{0}; };
     struct LatencyAccumulator {
@@ -1974,6 +2009,184 @@ private:
         }
     }
 
+    /**
+     * OFDMA: build one payload stream per user from cfg.ofdma. The BS-level
+     * _data_resource_layout is the union of all users (used for the symbol
+     * templates and filler); each stream's layout keeps only its own subcarriers.
+     */
+    void _build_ofdma_streams() {
+        _ofdma_users.clear();
+        if (!_cfg.ofdma.enabled) {
+            return;
+        }
+        const size_t queue_size = std::max<size_t>(4, _cfg.downlink_pipeline.data_packet_buffer_size);
+        for (size_t u = 0; u < _cfg.ofdma.num_users; ++u) {
+            auto us = std::make_unique<OfdmaUserStream>();
+            us->user_id = u;
+            us->udp_port = (u < _cfg.ofdma.users.size() && _cfg.ofdma.users[u].udp_input_port >= 0)
+                ? _cfg.ofdma.users[u].udp_input_port
+                : _cfg.network_output.udp_input_port + 10 * static_cast<int>(u);
+            us->layout = build_data_resource_grid_layout_for_user(_cfg, static_cast<int>(u));
+            us->subcarrier_indices_flat.reserve(us->layout.payload_re_count);
+            for (size_t sym_idx = 0; sym_idx < us->layout.data_symbol_count; ++sym_idx) {
+                const size_t base = us->layout.non_pilot_offsets[sym_idx];
+                for (size_t di = 0; di < us->layout.num_non_pilot_subcarriers; ++di) {
+                    if (us->layout.payload_rank[base + di] < 0) continue;
+                    us->subcarrier_indices_flat.push_back(us->layout.non_pilot_subcarrier_indices[di]);
+                }
+                if (us->subcarrier_indices_flat.size() != us->layout.payload_offsets[sym_idx + 1]) {
+                    throw std::runtime_error("OFDMA: failed to compact payload subcarrier indices for user " +
+                                             std::to_string(u));
+                }
+            }
+            if (us->layout.payload_re_count < LdpcPacketFraming::kIdentityControlSymbols) {
+                throw std::runtime_error(
+                    "OFDMA user " + std::to_string(u) + " has payload_re_count " +
+                    std::to_string(us->layout.payload_re_count) + " < kIdentityControlSymbols (" +
+                    std::to_string(LdpcPacketFraming::kIdentityControlSymbols) +
+                    "); give the user more subcarriers");
+            }
+            us->packets = std::make_unique<SPSCRingBuffer<AlignedIntVector>>(queue_size);
+            us->raw = std::make_unique<SPSCRingBuffer<RawUdpPacket>>(256);
+            us->data_pool.reserve(us->layout.payload_re_count);
+            us->modulated_pool.reserve(us->layout.payload_re_count);
+            LOG_G_INFO_M(Config) << "[OFDMA] user " << u << ": " << us->layout.payload_re_count
+                         << " payload RE/frame ("
+                         << us->layout.payload_re_count / std::max<size_t>(1, us->layout.data_symbol_count)
+                         << " subcarriers), effective "
+                         << AirFrameClock::effective_payload_re_count(
+                                us->layout.payload_re_count, LdpcPacketFraming::kIdentityControlSymbols)
+                         << " RE after the Identity SIB, UDP input port " << us->udp_port;
+            _ofdma_users.push_back(std::move(us));
+        }
+        LOG_G_INFO_M(Config) << "[OFDMA] " << _ofdma_users.size() << " users, scheme '" << _cfg.ofdma.scheme
+                     << "', union payload " << _data_resource_layout.payload_re_count << " RE/frame";
+    }
+
+    /** One frame's data pool for an OFDMA user: Identity SIB, then whole packets while they fit. */
+    void _fill_ofdma_user_pool(OfdmaUserStream& us, const AirFrameIdentity& air_id) {
+        us.data_pool.clear();
+        const size_t sib_syms = LdpcPacketFraming::kIdentityControlSymbols;
+        us.data_pool.resize(sib_syms);
+        LdpcPacketFraming::write_identity_control_qpsk(
+            static_cast<uint32_t>(air_id.timeline_epoch),
+            AirFrameClock::ota_frame_seq32(air_id.frame_seq),
+            us.data_pool.data());
+        const size_t capacity = us.layout.payload_re_count;
+        bool had_payload = false;
+        while (us.data_pool.size() < capacity) {
+            AlignedIntVector* pkt_slot = us.packets->consumer_slot();
+            if (pkt_slot == nullptr) break;
+            const size_t room = capacity - us.data_pool.size();
+            if (pkt_slot->size() > room) break;   // whole packets only; the rest waits for the next frame
+            AlignedIntVector pkt = std::move(*pkt_slot);
+            us.packets->consumer_pop();
+            us.data_pool.insert(us.data_pool.end(), pkt.begin(), pkt.end());
+            _data_packet_pool.release(std::move(pkt));
+            ++us.packets_sent;
+            had_payload = true;
+        }
+        if (had_payload) ++us.frames_with_payload;
+        us.modulated_pool.resize(us.data_pool.size());
+        auto* __restrict__ mod_ptr = us.modulated_pool.data();
+        const auto* __restrict__ src = us.data_pool.data();
+        for (size_t idx = 0; idx < us.data_pool.size(); ++idx) {
+            mod_ptr[idx] = _qpsk_symbol_from_int(src[idx]);
+        }
+    }
+
+    /** OFDMA UDP input: one socket per user, polled together, into per-user raw queues. */
+    void _udp_recv_proc_ofdma() {
+        std::vector<pollfd> fds;
+        for (auto& up : _ofdma_users) {
+            const int sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (sock < 0) {
+                LOG_G_ERROR_M(Mod) << "[OFDMA] UDP socket create failed for user " << up->user_id;
+                continue;
+            }
+            int enable = 1;
+            setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable));
+            constexpr int rcvbuf_size = 4 * 1024 * 1024;
+            setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+            sockaddr_in addr{};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(static_cast<uint16_t>(up->udp_port));
+            if (_cfg.network_output.udp_input_ip == "0.0.0.0") {
+                addr.sin_addr.s_addr = INADDR_ANY;
+            } else if (inet_pton(AF_INET, _cfg.network_output.udp_input_ip.c_str(), &addr.sin_addr) != 1) {
+                LOG_G_ERROR_M(Config) << "Invalid BS UDP bind IP: " << _cfg.network_output.udp_input_ip;
+                close(sock);
+                return;
+            }
+            if (bind(sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+                LOG_G_ERROR_M(Mod) << "[OFDMA] UDP bind failed for user " << up->user_id
+                             << " on port " << up->udp_port << ": " << std::strerror(errno);
+                close(sock);
+                continue;
+            }
+            fcntl(sock, F_SETFL, O_NONBLOCK);
+            up->sock.store(sock, std::memory_order_release);
+            fds.push_back(pollfd{sock, POLLIN, 0});
+        }
+        std::vector<uint8_t> udp_buf(65536);
+        while (_running.load(std::memory_order_relaxed) && !fds.empty()) {
+            const int ready = poll(fds.data(), fds.size(), 100);
+            if (ready <= 0) continue;
+            for (auto& up : _ofdma_users) {
+                const int sock = up->sock.load(std::memory_order_acquire);
+                if (sock < 0) continue;
+                for (;;) {
+                    const ssize_t n = recv(sock, udp_buf.data(), udp_buf.size(), 0);
+                    if (n <= 0) break;
+                    RawUdpPacket* pkt = up->raw->producer_slot();
+                    if (pkt == nullptr) {
+                        if (++up->raw_drops <= 20 || (up->raw_drops % 100) == 0) {
+                            LOG_G_WARN_M(Mod) << "[OFDMA] user " << up->user_id
+                                         << " UDP intermediate buffer full, dropping packet: dropped=" << up->raw_drops;
+                        }
+                        continue;
+                    }
+                    pkt->bytes.assign(udp_buf.begin(), udp_buf.begin() + n);
+                    pkt->ingest_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+                    up->raw->producer_commit();
+                }
+            }
+        }
+        for (auto& up : _ofdma_users) {
+            const int sock = up->sock.exchange(-1, std::memory_order_acq_rel);
+            if (sock >= 0) close(sock);
+        }
+    }
+
+    /** OFDMA encoder: round robin over users, each packet into its user's queue. */
+    template <typename AccumulateProfile>
+    void _udp_encode_proc_ofdma(bool do_latency_profile, AccumulateProfile& accumulate_profile) {
+        while (_running.load(std::memory_order_relaxed)) {
+            bool did_work = false;
+            for (auto& up : _ofdma_users) {
+                RawUdpPacket* pkt = up->raw->consumer_slot();
+                if (pkt == nullptr) continue;
+                did_work = true;
+                _encode_target_queue = up->packets.get();
+                _encode_effective_re = AirFrameClock::effective_payload_re_count(
+                    up->layout.payload_re_count, LdpcPacketFraming::kIdentityControlSymbols);
+                EncodePacketProfile profile;
+                const bool ok = _encode_and_enqueue_payload(
+                    pkt->bytes.data(), pkt->bytes.size(), pkt->ingest_ns, do_latency_profile, profile,
+                    /*track_arq=*/false);
+                _encode_target_queue = nullptr;
+                _encode_effective_re = 0;
+                up->raw->consumer_pop();
+                if (!ok) return;
+                accumulate_profile(profile);
+            }
+            if (!did_work) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
+    }
+
     void _precalc_positions() {
         _symbol_positions.reserve(_cfg.ofdm.num_symbols);
         for (size_t i = 0; i < _cfg.ofdm.num_symbols; ++i) {
@@ -2044,8 +2257,9 @@ private:
         const size_t padded_len = payload_blocks * bytes_per_ldpc_block;
         const size_t packet_qpsk_symbols =
             LdpcPacketFraming::packet_symbols(payload_blocks, _payload_modulation, _payload_rate.code_bits());
-        // Capacity is after per-frame Identity SIB reservation.
-        const size_t effective_re = _effective_payload_re_count();
+        // Capacity is after per-frame Identity SIB reservation (per user in OFDMA mode).
+        const size_t effective_re =
+            _encode_effective_re > 0 ? _encode_effective_re : _effective_payload_re_count();
         if (packet_qpsk_symbols > effective_re) {
             static std::atomic<uint64_t> dropped_capacity_count{0};
             const uint64_t dropped = dropped_capacity_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2124,9 +2338,11 @@ private:
         bool counted_full_wait = false;
         size_t queued_packets_ahead = 0;
         SPSCBackoff enqueue_backoff;
+        SPSCRingBuffer<AlignedIntVector>& target_queue =
+            _encode_target_queue ? *_encode_target_queue : _data_packet_buffer;
         while (_running.load(std::memory_order_relaxed)) {
-            queued_packets_ahead = _data_packet_buffer.size();
-            if (_data_packet_buffer.try_push(std::move(packet))) {
+            queued_packets_ahead = target_queue.size();
+            if (target_queue.try_push(std::move(packet))) {
                 enqueued = true;
                 if (do_latency_profile) {
                     const int64_t encoded_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2395,6 +2611,10 @@ private:
 
     void _udp_recv_proc() {
         bind_current_thread_from_downlink_hint(_cfg, 3);
+        if (!_ofdma_users.empty()) {
+            _udp_recv_proc_ofdma();
+            return;
+        }
         const int sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock < 0) {
             LOG_G_ERROR_M(Mod) << "UDP socket create failed";
@@ -2504,6 +2724,10 @@ private:
 
     template <typename AccumulateProfile>
     void _udp_encode_proc(bool do_latency_profile, AccumulateProfile& accumulate_profile) {
+        if (!_ofdma_users.empty()) {
+            _udp_encode_proc_ofdma(do_latency_profile, accumulate_profile);
+            return;
+        }
         std::vector<uint16_t> retransmit_seqs;
         while (_running.load(std::memory_order_relaxed)) {
             // ARQ: inject pending feedback packets with highest priority
@@ -2731,9 +2955,18 @@ private:
                 }
             }
 
+            // OFDMA: every user's stream gets its own Identity SIB and packets,
+            // placed on that user's subcarriers below. The legacy single pool is
+            // then left with the SIB only and is not scattered.
+            if (!_ofdma_users.empty()) {
+                for (auto& up : _ofdma_users) {
+                    _fill_ofdma_user_pool(*up, air_id);
+                }
+            }
+
             // Pull packets only when the *whole* packet fits in remaining room
             // after the Identity SIB (encode already enforces effective capacity).
-            while (data_pool.size() < max_data_syms_per_frame) {
+            while (_ofdma_users.empty() && data_pool.size() < max_data_syms_per_frame) {
                 if (packets_pulled >= measurement_packet_limit_per_frame) {
                     break;
                 }
@@ -2812,7 +3045,29 @@ private:
                 prof_step_start = ProfileClock::now();
                 std::memcpy(_fft_in.data(), _symbol_templates[i].data(),
                             _cfg.ofdm.fft_size * sizeof(std::complex<float>));
-                if (!is_reserved_sync_symbol(_cfg, i)) {
+                if (!is_reserved_sync_symbol(_cfg, i) && !_ofdma_users.empty()) {
+                    for (auto& up : _ofdma_users) {
+                        const OfdmaUserStream& us = *up;
+                        const int data_symbol_idx_int = us.layout.actual_symbol_to_data_symbol[i];
+                        if (data_symbol_idx_int < 0) {
+                            continue;
+                        }
+                        const size_t data_symbol_idx = static_cast<size_t>(data_symbol_idx_int);
+                        const size_t payload_begin = us.layout.payload_offsets[data_symbol_idx];
+                        const size_t payload_end = us.layout.payload_offsets[data_symbol_idx + 1];
+                        const size_t payload_count = payload_end - payload_begin;
+                        const size_t payload_available = (payload_begin < us.modulated_pool.size())
+                            ? std::min(payload_count, us.modulated_pool.size() - payload_begin)
+                            : 0;
+                        auto* __restrict__ fft_ptr = _fft_in.data();
+                        const auto* __restrict__ payload_ptr = us.modulated_pool.data();
+                        const int* __restrict__ payload_sc_ptr =
+                            us.subcarrier_indices_flat.data() + payload_begin;
+                        for (size_t payload_idx = 0; payload_idx < payload_available; ++payload_idx) {
+                            fft_ptr[payload_sc_ptr[payload_idx]] = payload_ptr[payload_begin + payload_idx];
+                        }
+                    }
+                } else if (!is_reserved_sync_symbol(_cfg, i)) {
                     const int data_symbol_idx_int = _data_resource_layout.actual_symbol_to_data_symbol[i];
                     if (data_symbol_idx_int >= 0) {
                         const size_t data_symbol_idx = static_cast<size_t>(data_symbol_idx_int);
