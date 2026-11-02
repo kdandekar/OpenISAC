@@ -164,6 +164,7 @@ struct DeviceConfig {
     double sim_tick_rate = 0.0;   // sample rate (Hz) reported as the radio clock
     double sim_center_freq = 0.0; // center freq used to synthesize tune results
     bool sim_predictive_delay = false; // validate simulator CFO/SRO consistency for UE prediction
+    int sim_ue_index = -1;        // multi-UE hub: this UE's index (own ring rx.comm.<i> and tune slot); -1 = single UE
 
     // --- XR1710G (receive-only, external stream controller) ---
     Xr1710gConfig xr1710g;

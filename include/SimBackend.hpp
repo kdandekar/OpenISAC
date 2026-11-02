@@ -103,6 +103,7 @@ private:
     std::string _session;
     double _tick_rate = 0.0;
     double _center_freq = 0.0;
+    int _ue_index = -1;   // >= 0: this process is UE i of a multi-UE hub (own tune-correction slot)
     std::shared_ptr<sim_shm::ShmControl> _ctrl;
 };
 

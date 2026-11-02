@@ -211,7 +211,8 @@ void SimRxStream::issue_stream_cmd(const StreamCmd& cmd) {
 SimDevice::SimDevice(const DeviceConfig& cfg)
     : _session(cfg.sim_session),
       _tick_rate(cfg.sim_tick_rate),
-      _center_freq(cfg.sim_center_freq) {
+      _center_freq(cfg.sim_center_freq),
+      _ue_index(cfg.sim_ue_index) {
     _ctrl = std::make_shared<sim_shm::ShmControl>();
     const std::string ctrl_name = sim_shm::make_shm_name(_session, "ctrl");
     if (!_ctrl->open(ctrl_name)) {
@@ -279,7 +280,11 @@ TuneResult SimDevice::set_rx_freq(const TuneRequest& req, size_t /*chan*/) {
     // untouched so it cannot race another stream's correction.
     const double dsp = (req.dsp_freq_policy == TunePolicy::Manual) ? req.dsp_freq : 0.0;
     if (req.dsp_freq_policy == TunePolicy::Manual && _ctrl) {
-        _ctrl->set_comm_rx_freq_correction_hz(dsp);
+        if (_ue_index >= 0) {
+            _ctrl->set_ue_rx_freq_correction_hz(static_cast<size_t>(_ue_index), dsp);
+        } else {
+            _ctrl->set_comm_rx_freq_correction_hz(dsp);
+        }
     }
     TuneResult r;
     r.target_rf_freq = req.target_freq != 0.0 ? req.target_freq : _center_freq;
@@ -290,11 +295,18 @@ TuneResult SimDevice::set_rx_freq(const TuneRequest& req, size_t /*chan*/) {
 }
 
 void SimDevice::set_rx_freq_correction(double hz) {
-    if (_ctrl) _ctrl->set_comm_rx_freq_correction_hz(hz);
+    if (!_ctrl) return;
+    if (_ue_index >= 0) {
+        _ctrl->set_ue_rx_freq_correction_hz(static_cast<size_t>(_ue_index), hz);
+    } else {
+        _ctrl->set_comm_rx_freq_correction_hz(hz);
+    }
 }
 
 double SimDevice::rx_freq_correction() const {
-    return _ctrl ? _ctrl->comm_rx_freq_correction_hz() : 0.0;
+    if (!_ctrl) return 0.0;
+    if (_ue_index >= 0) return _ctrl->ue_rx_freq_correction_hz(static_cast<size_t>(_ue_index));
+    return _ctrl->comm_rx_freq_correction_hz();
 }
 
 ITxStreamPtr SimDevice::get_tx_stream(const StreamArgs& args) {

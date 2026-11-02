@@ -406,6 +406,11 @@ struct SimControlBlock {
     std::atomic<int64_t> comm_rx_freq_correction_millihz; // Receiver-side comm RX tune correction
     std::atomic<int64_t> uplink_tx_freq_correction_millihz; // UE TX target-frequency correction
     char pad[8];
+    // Multi-UE (OFDMA) simulation: one RX tune-correction slot per simulated UE,
+    // written by the UE with simulation.ue_index = i and applied by the hub to
+    // ring rx.comm.<i>. Single-UE runs keep using comm_rx_freq_correction_millihz.
+    static constexpr size_t kMaxSimUes = 16;
+    std::atomic<int64_t> ue_rx_freq_correction_millihz[kMaxSimUes];
 };
 
 static constexpr uint64_t kShmCtrlMagic = 0x4F49534143435454ull; // "OISACCTT"
@@ -441,6 +446,7 @@ public:
         _blk->num_sensing_channels = num_sensing_channels;
         _blk->comm_rx_freq_correction_millihz.store(0, std::memory_order_relaxed);
         _blk->uplink_tx_freq_correction_millihz.store(0, std::memory_order_relaxed);
+        for (auto& slot : _blk->ue_rx_freq_correction_millihz) slot.store(0, std::memory_order_relaxed);
         _blk->magic.store(kShmCtrlMagic, std::memory_order_release);
     }
 
@@ -502,6 +508,19 @@ public:
         if (!_blk) return 0.0;
         return static_cast<double>(
             _blk->comm_rx_freq_correction_millihz.load(std::memory_order_acquire)) / 1000.0;
+    }
+    void set_ue_rx_freq_correction_hz(size_t ue_index, double value_hz) {
+        if (!_blk || !std::isfinite(value_hz) || ue_index >= SimControlBlock::kMaxSimUes) return;
+        const double scaled = value_hz * 1000.0;
+        const double lo = static_cast<double>(std::numeric_limits<int64_t>::min());
+        const double hi = static_cast<double>(std::numeric_limits<int64_t>::max());
+        const auto quantized = static_cast<int64_t>(std::llround(std::clamp(scaled, lo, hi)));
+        _blk->ue_rx_freq_correction_millihz[ue_index].store(quantized, std::memory_order_release);
+    }
+    double ue_rx_freq_correction_hz(size_t ue_index) const {
+        if (!_blk || ue_index >= SimControlBlock::kMaxSimUes) return 0.0;
+        return static_cast<double>(
+            _blk->ue_rx_freq_correction_millihz[ue_index].load(std::memory_order_acquire)) / 1000.0;
     }
     void set_uplink_tx_freq_correction_hz(double value_hz) {
         if (!_blk || !std::isfinite(value_hz)) return;

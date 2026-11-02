@@ -328,6 +328,13 @@ public:
         }
         _build_cfo_symbol_skip_mask();
         _build_compact_payload_indices();
+        _build_sensing_reference_keep();
+        if (cfg_.ofdma.enabled) {
+            LOG_G_INFO_M(Config) << "[OFDMA] this UE is user " << cfg_.ofdma.user_id << " of "
+                         << cfg_.ofdma.num_users << " (scheme '" << cfg_.ofdma.scheme << "'), "
+                         << _data_resource_layout.payload_re_count / std::max<size_t>(1, _data_resource_layout.data_symbol_count)
+                         << " own subcarriers; bistatic sensing data mode '" << _sensing_data_mode_name() << "'.";
+        }
         LOG_G_INFO_M(Config) << "Payload resource grid: " << _data_resource_layout.payload_re_count
                      << " payload RE out of " << _data_resource_layout.non_pilot_re_count
                      << " non-sync/non-pilot RE per frame"
@@ -688,6 +695,7 @@ private:
     const DataResourceGridLayout _data_resource_layout;
     std::vector<uint8_t> _cfo_symbol_skip_mask;
     std::vector<int> _payload_subcarrier_indices_flat;
+    std::vector<uint8_t> _sensing_reference_keep;   // sensing.bistatic_data_mode; empty = keep all
     std::vector<size_t> _payload_symbol_rows_flat;
     radio::IDevicePtr dev_;        // RX (+ uplink TX) radio device, any backend
     radio::IRxStreamPtr rx_stream_;
@@ -2808,6 +2816,34 @@ private:
         _cfo_symbol_skip_mask = build_cfo_tracking_skip_mask(cfg_, _duplex_layout);
     }
 
+    std::string _sensing_data_mode_name() const {
+        if (!cfg_.sensing.bistatic_data_mode.empty()) return cfg_.sensing.bistatic_data_mode;
+        return cfg_.ofdma.enabled ? "own" : "all";
+    }
+
+    /**
+     * Per-subcarrier keep mask for the bistatic sensing reference on data
+     * symbols (sensing.bistatic_data_mode). Empty = legacy "all": every
+     * non-pilot subcarrier is re-modulated by hard decision. Pilots are always
+     * kept (their known sequence is re-inserted by the re-modulator).
+     */
+    void _build_sensing_reference_keep() {
+        _sensing_reference_keep.clear();
+        const std::string mode = _sensing_data_mode_name();
+        if (mode == "all") {
+            return;
+        }
+        const size_t n = cfg_.ofdm.fft_size;
+        _sensing_reference_keep.assign(n, 0);
+        if (mode == "own") {
+            const std::vector<uint8_t> owned = ofdma_selected_subcarrier_mask(cfg_);
+            for (size_t k = 0; k < n; ++k) _sensing_reference_keep[k] = owned[k];
+        }
+        for (size_t k : cfg_.ofdm.pilot_positions) {
+            if (k < n) _sensing_reference_keep[k] = 1;
+        }
+    }
+
     FrameEvmStats _compute_frame_evm_stats(const std::vector<AlignedVector>& symbols,
                                            const std::vector<uint8_t>& modulation_mask) const
     {
@@ -3235,6 +3271,7 @@ private:
         dcfg.sim_tick_rate = cfg_.rf_sampling.sample_rate;
         dcfg.sim_center_freq = cfg_.downlink.center_freq;
         dcfg.sim_predictive_delay = cfg_.sync_tracking.predictive_delay;
+        dcfg.sim_ue_index = cfg_.simulation.ue_index;
         dcfg.xr1710g = cfg_.radio.xr1710g;
         return radio::make_device(dcfg);
     }
@@ -3281,7 +3318,10 @@ private:
 
         radio::StreamArgs args("fc32", cfg_.downlink.rx_wire_format);
         args.args["block_id"] = "radio";
-        args.args["sim_suffix"] = "rx.comm";
+        // Multi-UE hub: UE i reads ring rx.comm.<i>; the single-UE ring is rx.comm.
+        args.args["sim_suffix"] = cfg_.simulation.ue_index >= 0
+            ? "rx.comm." + std::to_string(cfg_.simulation.ue_index)
+            : "rx.comm";
         args.channels = {cfg_.downlink.rx_channel};
         rx_stream_ = dev_->get_rx_stream(args);
 
@@ -5593,6 +5633,16 @@ private:
                     if (_payload_modulation.is_qpsk()) {
                         QPSKModulator::remodulate_symbol(ctx.symbols[symbol_idx], zc_freq_,
                                                        cfg_.ofdm.pilot_positions, reference);
+                        if (!_sensing_reference_keep.empty()) {
+                            // OFDMA sensing data mode: exclude data subcarriers this
+                            // UE does not decode (other users, or all data for
+                            // "pilots"); a zero reference drops the RE from H = rx*conj(tx).
+                            const uint8_t* __restrict__ keep = _sensing_reference_keep.data();
+                            auto* __restrict__ ref_ptr = reference.data();
+                            for (size_t k = 0; k < reference.size(); ++k) {
+                                if (keep[k] == 0) ref_ptr[k] = std::complex<float>(0.0f, 0.0f);
+                            }
+                        }
                     } else {
                         const auto& equalized = ctx.symbols[symbol_idx];
                         _payload_modulation.remodulate_samples(
