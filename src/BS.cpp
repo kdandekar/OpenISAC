@@ -162,9 +162,9 @@ public:
             }
             return sv;
         }),
-        // OFDMA keeps one encoded-packet queue per user, so the pool must hold
-        // num_users queues' worth of buffers or the encoder thrashes malloc on
-        // every 47 kB packet (measured: 4 users fell from 8.5 to 5 Mbit/s total).
+        // OFDMA keeps one encoded-packet queue per user, so the pool holds
+        // num_users queues' worth of buffers; otherwise a saturated encoder
+        // re-allocates its 47 kB packet buffers once the shared pool runs dry.
         _data_packet_pool(64, []() {
             return AlignedIntVector();
         }, std::max<size_t>(

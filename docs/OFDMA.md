@@ -76,6 +76,12 @@ control block (up to 16 UEs). The uplink is not simulated in multi-UE mode.
 Start order and ports are as for the single-UE simulator: hub first, then BS, then the UEs,
 each UE in its own directory with its own `UE.yaml` and distinct ZMQ/UDP ports.
 
+Note on time: the hub advances air time only as fast as its slowest consumer reads, so with one or
+more UEs attached a simulated link typically runs below real time (about 0.5x with one UE and 0.25x
+with four on a 48-core Xeon at 25 MS/s; the stock single-UE 50 MS/s configuration behaves the same).
+Nothing is lost, the clock just stretches: measure link throughput in packets per transmitted frame,
+or read the hub's "produced N samples (T s of air time)" log lines, not in bits per wall-clock second.
+
 ## Tests
 
 `OfdmaLayoutTest` (ctest) checks the masks and layouts for every scheme, the validation of
