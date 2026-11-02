@@ -592,12 +592,19 @@ private:
         uint64_t packets_sent = 0;
         uint64_t packets_encoded = 0;
         uint64_t frames_total = 0;
+        // Per-user modulation and coding (defaults: the global modulation.scheme / ldpc.code_rate).
+        DigitalModulation modulation{ModulationScheme::Qpsk};
+        LdpcRateMatching rate{};
+        std::unique_ptr<Scrambler> scrambler;
     };
     std::vector<std::unique_ptr<OfdmaUserStream>> _ofdma_users;
     // Encode-side redirection for OFDMA (set by the single encode thread before
     // each _encode_and_enqueue_payload call; null = legacy queue/capacity).
     SPSCRingBuffer<AlignedIntVector>* _encode_target_queue = nullptr;
     size_t _encode_effective_re = 0;
+    const DigitalModulation* _encode_modulation = nullptr;   // null = _payload_modulation
+    const LdpcRateMatching* _encode_rate = nullptr;          // null = _payload_rate
+    const Scrambler* _encode_scrambler = nullptr;            // null = scrambler
     std::thread _udp_recv_thread; // UDP recv thread (separate from LDPC encode)
     struct PktTimestamps { int64_t ingest_ns{0}; int64_t encoded_ns{0}; };
     struct LatencyAccumulator {
@@ -2052,6 +2059,15 @@ private:
                     std::to_string(LdpcPacketFraming::kIdentityControlSymbols) +
                     "); give the user more subcarriers");
             }
+            if (u < _cfg.ofdma.users.size() && !_cfg.ofdma.users[u].modulation.empty()) {
+                us->modulation = DigitalModulation(parse_modulation_scheme(_cfg.ofdma.users[u].modulation));
+            } else {
+                us->modulation = _payload_modulation;
+            }
+            us->rate = (u < _cfg.ofdma.users.size() && !_cfg.ofdma.users[u].code_rate.empty())
+                ? LdpcRateMatching(parse_ldpc_code_rate(_cfg.ofdma.users[u].code_rate))
+                : _payload_rate;
+            us->scrambler = std::make_unique<Scrambler>(LdpcPacketFraming::scrambler_bits(us->modulation), 0x5A);
             us->packets = std::make_unique<SPSCRingBuffer<AlignedIntVector>>(queue_size);
             us->raw = std::make_unique<SPSCRingBuffer<RawUdpPacket>>(256);
             us->data_pool.reserve(us->layout.payload_re_count);
@@ -2062,7 +2078,8 @@ private:
                          << " subcarriers), effective "
                          << AirFrameClock::effective_payload_re_count(
                                 us->layout.payload_re_count, LdpcPacketFraming::kIdentityControlSymbols)
-                         << " RE after the Identity SIB, UDP input port " << us->udp_port;
+                         << " RE after the Identity SIB, UDP input port " << us->udp_port
+                         << ", constellation order " << us->modulation.order() << ", code bits " << us->rate.code_bits() << "/1008";
             _ofdma_users.push_back(std::move(us));
         }
         LOG_G_INFO_M(Config) << "[OFDMA] " << _ofdma_users.size() << " users, scheme '" << _cfg.ofdma.scheme
@@ -2102,8 +2119,9 @@ private:
         us.modulated_pool.resize(us.data_pool.size());
         auto* __restrict__ mod_ptr = us.modulated_pool.data();
         const auto* __restrict__ src = us.data_pool.data();
+        // SIB and packet control tokens are QPSK-valued tokens that every constellation maps.
         for (size_t idx = 0; idx < us.data_pool.size(); ++idx) {
-            mod_ptr[idx] = _qpsk_symbol_from_int(src[idx]);
+            mod_ptr[idx] = us.modulation.modulate_token(src[idx]);
         }
     }
 
@@ -2181,6 +2199,9 @@ private:
                 if (pkt == nullptr) continue;
                 did_work = true;
                 _encode_target_queue = up->packets.get();
+                _encode_modulation = &up->modulation;
+                _encode_rate = &up->rate;
+                _encode_scrambler = up->scrambler.get();
                 _encode_effective_re = AirFrameClock::effective_payload_re_count(
                     up->layout.payload_re_count, LdpcPacketFraming::kIdentityControlSymbols);
                 EncodePacketProfile profile;
@@ -2188,6 +2209,9 @@ private:
                     pkt->bytes.data(), pkt->bytes.size(), pkt->ingest_ns, do_latency_profile, profile,
                     /*track_arq=*/false);
                 _encode_target_queue = nullptr;
+                _encode_modulation = nullptr;
+                _encode_rate = nullptr;
+                _encode_scrambler = nullptr;
                 _encode_effective_re = 0;
                 up->raw->consumer_pop();
                 ++up->packets_encoded;
@@ -2266,10 +2290,13 @@ private:
             return true;
         }
 
+        const DigitalModulation& modulation = _encode_modulation ? *_encode_modulation : _payload_modulation;
+        const LdpcRateMatching& rate = _encode_rate ? *_encode_rate : _payload_rate;
+        const Scrambler& scr = _encode_scrambler ? *_encode_scrambler : scrambler;
         const size_t payload_blocks = LdpcPacketFraming::payload_blocks_for_len(payload_len);
         const size_t padded_len = payload_blocks * bytes_per_ldpc_block;
         const size_t packet_qpsk_symbols =
-            LdpcPacketFraming::packet_symbols(payload_blocks, _payload_modulation, _payload_rate.code_bits());
+            LdpcPacketFraming::packet_symbols(payload_blocks, modulation, rate.code_bits());
         // Capacity is after per-frame Identity SIB reservation (per user in OFDMA mode).
         const size_t effective_re =
             _encode_effective_re > 0 ? _encode_effective_re : _effective_payload_re_count();
@@ -2321,12 +2348,12 @@ private:
         _ldpc_qpsk_scratch.clear();
         if (payload_blocks > 0) {
             _ldpc.encode_frame(_ldpc_input_bytes, _ldpc_encoded_bits_scratch);
-            scrambler.scramble(_ldpc_encoded_bits_scratch);
+            scr.scramble(_ldpc_encoded_bits_scratch);
             _bit_interleaver->interleave_inplace(
                 _ldpc_encoded_bits_scratch,
                 _interleaver_bits_scratch);
-            _payload_rate.match_inplace(_ldpc_encoded_bits_scratch, _interleaver_bits_scratch);
-            _payload_modulation.pack_bits(_ldpc_encoded_bits_scratch, _ldpc_qpsk_scratch, _payload_rate.code_bits());
+            rate.match_inplace(_ldpc_encoded_bits_scratch, _interleaver_bits_scratch);
+            modulation.pack_bits(_ldpc_encoded_bits_scratch, _ldpc_qpsk_scratch, rate.code_bits());
         }
         prof_step_end = ProfileClock::now();
         profile.payload_encode_us =

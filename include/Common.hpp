@@ -1605,6 +1605,9 @@ inline constexpr const char* kOfdmaSchemeExplicit = "explicit";
 
 struct OfdmaUserConfig {
     int udp_input_port = -1;                    // BS: UDP payload input for this user (-1 = udp_input_port + 10*u)
+    std::string modulation = "";                // BS: this user's payload modulation (empty = modulation.scheme)
+    std::string code_rate = "";                 // BS: this user's LDPC payload rate 1/2, 2/3, 3/4 (empty = ldpc.code_rate)
+    // The user's UE must set modulation.scheme and ldpc.code_rate to the same values.
 };
 
 struct OfdmaConfig {
@@ -3732,6 +3735,10 @@ inline bool load_ofdma_config_from_yaml(Config& cfg, const YAML::Node& config, c
         for (const auto& node : o["users"]) {
             OfdmaUserConfig u;
             if (node["udp_input_port"]) u.udp_input_port = node["udp_input_port"].as<int>();
+            if (node["modulation"]) u.modulation = node["modulation"].as<std::string>();
+            if (node["code_rate"]) u.code_rate = node["code_rate"].as<std::string>();
+            if (!u.modulation.empty()) (void)parse_modulation_scheme(u.modulation);   // throws on a bad name
+            if (!u.code_rate.empty()) (void)parse_ldpc_code_rate(u.code_rate);
             out.users.push_back(u);
         }
     }
@@ -3774,10 +3781,6 @@ inline bool load_ofdma_config_from_yaml(Config& cfg, const YAML::Node& config, c
         }
         if (cfg.uplink.ertm_to_enable) {
             LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled does not support eRTM payload injection in this version.";
-            return false;
-        }
-        if (cfg.modulation.scheme != ModulationScheme::Qpsk) {
-            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled requires modulation.scheme QPSK in this version.";
             return false;
         }
         (void)build_ofdma_user_subcarrier_masks(cfg);   // validate now, with a clear message
