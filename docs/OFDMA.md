@@ -32,8 +32,20 @@ ofdma:
 in frequency. Every user gets the same number of whole clusters; leftover data subcarriers carry
 the usual random filler. `explicit` lists are checked for range, pilots and overlap. A user's
 mask must leave room for the per-frame Identity SIB (192 QPSK symbols); the BS refuses to start
-otherwise. ARQ, measurement mode, eRTM payload injection and non-QPSK modulation are not
-supported together with OFDMA in this version.
+otherwise. ARQ, measurement mode and eRTM payload injection are not supported together with OFDMA
+in this version.
+
+Each BS user entry may also carry its own modulation and LDPC payload rate:
+
+```yaml
+  users:
+    - { udp_input_port: 50000, modulation: QPSK, code_rate: "1/2" }
+    - { udp_input_port: 50010, modulation: 16QAM, code_rate: "3/4" }
+```
+
+The defaults are the global `modulation.scheme` and `ldpc.code_rate`; the UE of that user sets those
+two global keys to the same values. The Identity SIB and the per-packet control symbols stay QPSK.
+The encoder serves users in proportion to the bits their share carries per frame.
 
 Per frame, each user's subcarriers carry that user's Identity SIB followed by whole LDPC packets
 from its UDP input, in the same rank order the single-user link uses, so the UE's frame lock,

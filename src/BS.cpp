@@ -596,6 +596,7 @@ private:
         DigitalModulation modulation{ModulationScheme::Qpsk};
         LdpcRateMatching rate{};
         std::unique_ptr<Scrambler> scrambler;
+        size_t encode_weight = 1;   // packets per encoder pass, proportional to the user's bits per frame
     };
     std::vector<std::unique_ptr<OfdmaUserStream>> _ofdma_users;
     // Encode-side redirection for OFDMA (set by the single encode thread before
@@ -2082,6 +2083,21 @@ private:
                          << ", constellation order " << us->modulation.order() << ", code bits " << us->rate.code_bits() << "/1008";
             _ofdma_users.push_back(std::move(us));
         }
+        // Encoder fairness: serve each user in proportion to the bits its share carries per
+        // frame, so a user with more subcarriers or a denser constellation is not held to the
+        // smallest user's packet rate when the single encoder thread is the bottleneck.
+        double min_bits = 0.0;
+        std::vector<double> bits(_ofdma_users.size());
+        for (size_t u = 0; u < _ofdma_users.size(); ++u) {
+            const auto& us = *_ofdma_users[u];
+            bits[u] = std::log2(static_cast<double>(us.modulation.order())) *
+                      static_cast<double>(us.rate.code_bits()) / 1008.0 *
+                      static_cast<double>(us.layout.payload_re_count);
+            min_bits = (u == 0) ? bits[u] : std::min(min_bits, bits[u]);
+        }
+        for (size_t u = 0; u < _ofdma_users.size(); ++u) {
+            _ofdma_users[u]->encode_weight = static_cast<size_t>(std::max(1.0, std::round(bits[u] / std::max(1.0, min_bits))));
+        }
         LOG_G_INFO_M(Config) << "[OFDMA] " << _ofdma_users.size() << " users, scheme '" << _cfg.ofdma.scheme
                      << "', union payload " << _data_resource_layout.payload_re_count << " RE/frame";
     }
@@ -2195,8 +2211,9 @@ private:
         while (_running.load(std::memory_order_relaxed)) {
             bool did_work = false;
             for (auto& up : _ofdma_users) {
+              for (size_t n = 0; n < up->encode_weight; ++n) {
                 RawUdpPacket* pkt = up->raw->consumer_slot();
-                if (pkt == nullptr) continue;
+                if (pkt == nullptr) break;
                 did_work = true;
                 _encode_target_queue = up->packets.get();
                 _encode_modulation = &up->modulation;
@@ -2217,6 +2234,7 @@ private:
                 ++up->packets_encoded;
                 if (!ok) return;
                 accumulate_profile(profile);
+              }
             }
             if (!did_work) {
                 std::this_thread::sleep_for(std::chrono::microseconds(200));
