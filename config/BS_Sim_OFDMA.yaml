@@ -1,0 +1,76 @@
+# OpenISAC base station, channel simulator, OFDMA with four users.
+# Start ChannelSimulator (reads this file) first, then BS, then one UE per user
+# (UE_Sim_OFDMA.yaml with ofdma.user_id and simulation.ue_index set).
+# Everything not listed here keeps the BS_Sim.yaml defaults.
+
+radio:
+  radio_backend: sim
+
+simulation:
+  session: oisac_sim
+  enable_comm_rx: true
+  enable_sensing_rx: false          # bistatic sensing at the UEs is what OFDMA changes; monostatic off saves CPU
+  enable_uplink: false              # UEs never transmit
+  pacing_enabled: true
+  noise_power_dbfs: -70
+  snr_control_enable: true
+  target_snr_db: 30                 # common SNR; per-UE snr_offset_db is added
+  control_port: 10002
+  cfo_hz: 5000
+  comm_multipath_taps:
+    - { delay_samples: 0, gain_db: -30, phase_deg: 0 }
+  bistatic_targets:
+    - { range_m: 30, velocity_mps: 5, gain_db: -50, angle_deg: 0 }
+    - { range_m: 75, velocity_mps: -3, gain_db: -56, angle_deg: 0 }
+  ues:                              # one downlink receiver per UE: ring rx.comm.<i>
+    - { name: ue0, snr_offset_db: 0 }
+    - { name: ue1, snr_offset_db: -3 }
+    - { name: ue2, snr_offset_db: -6, cfo_hz: -2000 }
+    - { name: ue3, snr_offset_db: -9, comm_multipath_taps: [ { delay_samples: 0, gain_db: -30 }, { delay_samples: 7, gain_db: -36, phase_deg: 90 } ] }
+
+rf_sampling:
+  sample_rate: 25000000
+  bandwidth: 25000000
+
+ofdm_frame:
+  fft_size: 1024
+  cp_length: 128
+  num_symbols: 100
+  sensing_symbol_num: 100
+  zc_root: 29
+  pilot_positions: [571, 631, 692, 752, 812, 872, 933, 993, 29, 89, 150, 210, 270, 330, 391, 451]
+  midframe_pilot_symbols: [19, 39, 59, 79, 99]
+
+ofdma:
+  enabled: true
+  num_users: 4
+  scheme: interleaved               # interleaved | clusters | blocks | explicit
+  cluster_size: 8                   # clusters only
+  # scheme: explicit uses user_subcarriers: [[...], [...], ...] or mask_file: masks.yaml
+  users:                            # one UDP payload input per user
+    - { udp_input_port: 50000 }
+    - { udp_input_port: 50010 }
+    - { udp_input_port: 50020 }
+    - { udp_input_port: 50030 }
+
+downlink:
+  center_freq: 1300000000
+  tx_gain: 0
+
+uplink:
+  enabled: false
+  symbol_count: 0
+
+sensing:
+  rx_channel_count: 0
+
+network_output:
+  udp_input_port: 50000
+  control_port: 9999
+
+cpu_cores:
+  downlink_cpu_cores: [-1, -1, -1, -1]
+  main_cpu_core: -1
+
+logging:
+  default_level: info

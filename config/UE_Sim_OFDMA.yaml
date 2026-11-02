@@ -1,0 +1,54 @@
+# OpenISAC UE for an OFDMA channel-simulator run (see BS_Sim_OFDMA.yaml).
+# Copy once per user, set ofdma.user_id and simulation.ue_index to the same
+# index, and give every UE process its own network ports and directory.
+
+radio:
+  radio_backend: sim
+
+simulation:
+  session: oisac_sim
+  ue_index: 0                       # which simulation.ues[] receiver this process is
+
+rf_sampling:
+  sample_rate: 25000000
+  bandwidth: 25000000
+  rx_gain: 10
+
+ofdm_frame:
+  fft_size: 1024
+  cp_length: 128
+  num_symbols: 100
+  sensing_symbol_num: 100
+  zc_root: 29
+  pilot_positions: [571, 631, 692, 752, 812, 872, 933, 993, 29, 89, 150, 210, 270, 330, 391, 451]
+  midframe_pilot_symbols: [19, 39, 59, 79, 99]
+
+ofdma:                              # must match the BS
+  enabled: true
+  num_users: 4
+  scheme: interleaved
+  cluster_size: 8
+  user_id: 0
+
+downlink:
+  center_freq: 1300000000
+
+uplink:
+  symbol_count: 0                   # UEs never transmit
+
+sensing:
+  bi_enabled: true
+  bistatic_data_mode: own           # own | all | pilots: data subcarriers used in the sensing reference
+
+network_output:
+  udp_output_port: 50001            # + 10 * user_id
+  bi_sensing_port: 8889             # + 100 * user_id for every UE ZMQ port
+  control_port: 10001
+
+cpu_cores:
+  downlink_cpu_cores: [-1, -1, -1]
+  sensing_cpu_cores: [-1]
+  main_cpu_core: -1
+
+logging:
+  default_level: info

@@ -27,6 +27,8 @@
 #include <thread>
 #include <vector>
 
+#include <fftw3.h>
+
 #include "AsyncLogger.hpp"
 #include "Common.hpp"
 #include "ShmRing.hpp"
@@ -325,6 +327,114 @@ bool load_steering_override(const std::string& path, size_t num_targets,
 
 } // namespace
 
+/**
+ * Static frequency-selective channel from a measured frequency response, applied
+ * by FFT overlap-save. The response file holds `fft_size` complex<float> values
+ * H[k] in FFT-bin order at the simulator's subcarrier spacing fs/fft_size; the
+ * impulse response ifft(H) is truncated to `taps` samples (the cyclic prefix),
+ * which keeps every detail wider than fft_size/taps subcarriers.
+ */
+class FirFftChannel {
+public:
+    FirFftChannel(const std::vector<cf>& impulse, size_t block_fft)
+        : _lh(impulse.size()), _nfft(block_fft), _block(block_fft - impulse.size() + 1) {
+        if (_lh == 0 || _nfft < 2 * _lh) throw std::runtime_error("FirFftChannel: bad sizes");
+        _in.assign(_nfft, cf(0.0f, 0.0f));
+        _freq.assign(_nfft, cf(0.0f, 0.0f));
+        _h_freq.assign(_nfft, cf(0.0f, 0.0f));
+        _hist.assign(_lh - 1, cf(0.0f, 0.0f));
+        _fwd = fftwf_plan_dft_1d(static_cast<int>(_nfft), reinterpret_cast<fftwf_complex*>(_in.data()),
+                                 reinterpret_cast<fftwf_complex*>(_freq.data()), FFTW_FORWARD, FFTW_ESTIMATE);
+        _inv = fftwf_plan_dft_1d(static_cast<int>(_nfft), reinterpret_cast<fftwf_complex*>(_freq.data()),
+                                 reinterpret_cast<fftwf_complex*>(_in.data()), FFTW_BACKWARD, FFTW_ESTIMATE);
+        std::copy(impulse.begin(), impulse.end(), _in.begin());
+        fftwf_execute(_fwd);
+        const float inv_n = 1.0f / static_cast<float>(_nfft);
+        for (size_t i = 0; i < _nfft; ++i) _h_freq[i] = _freq[i] * inv_n;   // fold the IFFT scale in
+    }
+    ~FirFftChannel() {
+        fftwf_destroy_plan(_fwd);
+        fftwf_destroy_plan(_inv);
+    }
+    FirFftChannel(const FirFftChannel&) = delete;
+    FirFftChannel& operator=(const FirFftChannel&) = delete;
+
+    /** y[n] = sum_j h[j] x[n-j], continuous across calls. */
+    void process(const cf* x, cf* y, size_t count) {
+        size_t done = 0;
+        while (done < count) {
+            const size_t m = std::min(_block, count - done);
+            std::copy(_hist.begin(), _hist.end(), _in.begin());
+            std::copy(x + done, x + done + m, _in.begin() + (_lh - 1));
+            std::fill(_in.begin() + (_lh - 1) + m, _in.end(), cf(0.0f, 0.0f));
+            // history for the next block: last lh-1 input samples seen so far
+            if (m >= _lh - 1) {
+                std::copy(x + done + m - (_lh - 1), x + done + m, _hist.begin());
+            } else {
+                std::vector<cf> tmp(_hist.begin() + m, _hist.end());
+                std::copy(tmp.begin(), tmp.end(), _hist.begin());
+                std::copy(x + done, x + done + m, _hist.begin() + (_lh - 1 - m));
+            }
+            fftwf_execute(_fwd);
+            for (size_t i = 0; i < _nfft; ++i) _freq[i] *= _h_freq[i];
+            fftwf_execute(_inv);
+            std::copy(_in.begin() + (_lh - 1), _in.begin() + (_lh - 1) + m, y + done);
+            done += m;
+        }
+    }
+
+private:
+    size_t _lh, _nfft, _block;
+    std::vector<cf> _in, _freq, _h_freq, _hist;
+    fftwf_plan _fwd, _inv;
+};
+
+// Load fft_size complex<float> values (FFT-bin order) and turn them into a
+// `taps`-sample impulse response. Returns false when the file is unusable.
+static bool load_channel_impulse(const std::string& path, size_t fft_size, size_t taps,
+                                 std::vector<cf>& impulse, double& kept_energy_fraction) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    std::vector<cf> H(fft_size);
+    in.read(reinterpret_cast<char*>(H.data()), static_cast<std::streamsize>(fft_size * sizeof(cf)));
+    if (static_cast<size_t>(in.gcount()) != fft_size * sizeof(cf)) return false;
+    std::vector<cf> h(fft_size);
+    fftwf_plan p = fftwf_plan_dft_1d(static_cast<int>(fft_size), reinterpret_cast<fftwf_complex*>(H.data()),
+                                     reinterpret_cast<fftwf_complex*>(h.data()), FFTW_BACKWARD, FFTW_ESTIMATE);
+    fftwf_execute(p);
+    fftwf_destroy_plan(p);
+    double total = 0.0, kept = 0.0;
+    for (size_t i = 0; i < fft_size; ++i) {
+        const double e = std::norm(h[i]);
+        total += e;
+        if (i < taps) kept += e;
+    }
+    kept_energy_fraction = total > 0.0 ? kept / total : 0.0;
+    impulse.assign(h.begin(), h.begin() + std::min(taps, fft_size));
+    const float inv_n = 1.0f / static_cast<float>(fft_size);
+    for (auto& v : impulse) v *= inv_n;
+    return true;
+}
+
+/** One simulated downlink receiver (single-UE legacy, or simulation.ues[i]). */
+struct UeChannel {
+    std::string name;
+    std::string ring_suffix;
+    int slot = -1;                              // -1: legacy control-block slot, else ue index
+    std::vector<Tap> taps;                      // static TDL (unused when fir is set)
+    std::vector<Target> bistatic_targets;       // own Doppler phasor state
+    std::unique_ptr<FirFftChannel> fir;         // measured frequency response
+    std::unique_ptr<sim_shm::ShmRing> ring;
+    std::vector<sample_t> out;
+    std::vector<sample_t> sro_out;
+    std::unique_ptr<PolyphaseSincResampler> sro;
+    cf cfo_phasor{1.0f, 0.0f};
+    double cfo_hz = 0.0;
+    double snr_offset_db = 0.0;
+    double last_logged_correction_hz = 0.0;
+    bool have_logged_correction = false;
+};
+
 int main(int argc, char** argv) {
     async_logger::AsyncLoggerGuard async_logger_guard;
     std::signal(SIGINT, &handle_signal);
@@ -460,6 +570,75 @@ int main(int argc, char** argv) {
     }
     for (const auto& tap : taps) max_delay = std::max(max_delay, tap.delay_samples);
 
+    auto build_taps = [&](const std::vector<SimMultipathTap>& list) {
+        std::vector<Tap> out;
+        for (const auto& tp : list) {
+            const double amp = db_to_linear_amplitude(tp.gain_db);
+            const double ph = tp.phase_deg * kTwoPi / 360.0;
+            Tap tap;
+            tap.gain = cf(static_cast<float>(amp * std::cos(ph)), static_cast<float>(amp * std::sin(ph)));
+            tap.delay_samples = tp.delay_samples + sim.timing_offset_samples;
+            if (tap.delay_samples < 0) tap.delay_samples = 0;
+            out.push_back(tap);
+        }
+        return out;
+    };
+
+    // --- Downlink receivers: one per UE (legacy single "rx.comm" when ues is empty) ---
+    std::vector<UeChannel> ues;
+    if (enable_comm) {
+        if (sim.ues.empty()) {
+            UeChannel ue;
+            ue.name = "ue";
+            ue.ring_suffix = "rx.comm";
+            ue.slot = -1;
+            ue.taps = taps;
+            ue.bistatic_targets = bistatic_targets;
+            ue.cfo_hz = sim.cfo_hz;
+            ues.push_back(std::move(ue));
+        } else {
+            if (sim.ues.size() > sim_shm::SimControlBlock::kMaxSimUes) {
+                LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] at most " << sim_shm::SimControlBlock::kMaxSimUes
+                              << " simulated UEs are supported (got " << sim.ues.size() << ")";
+                return 1;
+            }
+            if (enable_uplink) {
+                LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] simulation.ues (multi-UE) does not support enable_uplink";
+                return 1;
+            }
+            for (size_t i = 0; i < sim.ues.size(); ++i) {
+                const SimUeConfig& uc = sim.ues[i];
+                UeChannel ue;
+                ue.name = uc.name.empty() ? ("ue" + std::to_string(i)) : uc.name;
+                ue.ring_suffix = "rx.comm." + std::to_string(i);
+                ue.slot = static_cast<int>(i);
+                ue.taps = uc.comm_multipath_taps.empty() ? taps : build_taps(uc.comm_multipath_taps);
+                for (const auto& tap : ue.taps) max_delay = std::max(max_delay, tap.delay_samples);
+                ue.bistatic_targets = build_target_table(bistatic_src, false);
+                ue.cfo_hz = std::isfinite(uc.cfo_hz) ? uc.cfo_hz : sim.cfo_hz;
+                ue.snr_offset_db = uc.snr_offset_db;
+                if (!uc.channel_file.empty()) {
+                    std::vector<cf> impulse;
+                    double kept = 0.0;
+                    const size_t fir_taps = std::max<size_t>(8, cfg.ofdm.cp_length);
+                    if (!load_channel_impulse(uc.channel_file, cfg.ofdm.fft_size, fir_taps, impulse, kept)) {
+                        LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] " << ue.name << ": cannot read channel_file '"
+                                      << uc.channel_file << "' (" << cfg.ofdm.fft_size << " complex<float> expected)";
+                        return 1;
+                    }
+                    ue.fir = std::make_unique<FirFftChannel>(impulse, 4096);
+                    LOG_G_INFO_M(ChannelSim) << "[ChannelSim] " << ue.name << ": frequency response from '"
+                                 << uc.channel_file << "', " << impulse.size() << "-tap impulse response keeps "
+                                 << kept * 100.0 << "% of the energy";
+                }
+                LOG_G_INFO_M(ChannelSim) << "[ChannelSim] " << ue.name << ": ring " << ue.ring_suffix
+                             << ", cfo=" << ue.cfo_hz << " Hz, snr_offset=" << ue.snr_offset_db << " dB, "
+                             << (ue.fir ? "measured channel" : std::to_string(ue.taps.size()) + " taps");
+                ues.push_back(std::move(ue));
+            }
+        }
+    }
+
     const size_t L = static_cast<size_t>(max_delay) + 1; // history length
 
     // --- Build reciprocal uplink (UE->BS) communication channel ---
@@ -496,10 +675,7 @@ int main(int argc, char** argv) {
     // `simulation.cfo_hz` is the injected transmitter/receiver carrier mismatch.
     // The UE writes its simulated RX frequency correction into the shared
     // control block, so the comm path rotates with the residual CFO after retuning.
-    cf downlink_cfo_phasor(1.0f, 0.0f);
     const double comm_rx_sample_rate = fs * ue_to_bs_sample_rate_ratio;
-    double last_logged_rx_freq_correction_hz = 0.0;
-    bool have_logged_rx_freq_correction = false;
 
     // The same BS/UE oscillator mismatch appears with the opposite sign on the
     // reciprocal UE->BS link. In FDD, the mismatch in Hz scales with carrier
@@ -538,9 +714,9 @@ int main(int argc, char** argv) {
         r->create(sim_shm::make_shm_name(sim.session, "rx.sens" + std::to_string(k)), sim.ring_capacity_samples);
         sens_rings.push_back(std::move(r));
     }
-    sim_shm::ShmRing comm_ring;
-    if (enable_comm) {
-        comm_ring.create(sim_shm::make_shm_name(sim.session, "rx.comm"), sim.ring_capacity_samples);
+    for (auto& ue : ues) {
+        ue.ring = std::make_unique<sim_shm::ShmRing>();
+        ue.ring->create(sim_shm::make_shm_name(sim.session, ue.ring_suffix), sim.ring_capacity_samples);
     }
     // Uplink transport: the UE produces into "ul.tx"; the hub applies the uplink
     // channel and publishes into "rx.ul" for the BS uplink RX to consume.
@@ -597,11 +773,12 @@ int main(int argc, char** argv) {
     std::vector<sample_t> ext(L + max_chunk);                 // [history | new chunk]
     std::fill(ext.begin(), ext.begin() + L, sample_t(0.0f, 0.0f));
     std::vector<std::vector<sample_t>> out_sens(num_channels, std::vector<sample_t>(max_chunk));
-    std::vector<sample_t> out_comm(max_chunk);
-    std::vector<sample_t> comm_sro_out;
-    PolyphaseSincResampler comm_sro_resampler(
-        1.0 / ue_to_bs_sample_rate_ratio,
-        ue_to_bs_sample_rate_ratio);
+    for (auto& ue : ues) {
+        ue.out.assign(max_chunk, sample_t(0.0f, 0.0f));
+        ue.sro = std::make_unique<PolyphaseSincResampler>(
+            1.0 / ue_to_bs_sample_rate_ratio,
+            ue_to_bs_sample_rate_ratio);
+    }
     // Uplink processing buffers: [history | new UE-clock chunk] for the TDL, plus
     // staging/output buffers. A BS-clock chunk of M samples spans about M*ratio
     // UE samples, then the reciprocal resampler publishes BS-clock rx.ul samples.
@@ -651,11 +828,15 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        if (enable_comm && !comm_ring.timeline_origin_is_set() &&
-            !comm_ring.set_timeline_origin(chunk_start_sample)) {
-            LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] failed to establish communication RX timeline";
-            break;
+        bool comm_timeline_failed = false;
+        for (auto& ue : ues) {
+            if (!ue.ring->timeline_origin_is_set() &&
+                !ue.ring->set_timeline_origin(chunk_start_sample)) {
+                LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] failed to establish communication RX timeline for " << ue.name;
+                comm_timeline_failed = true;
+            }
         }
+        if (comm_timeline_failed) break;
         if (enable_uplink && !ul_rx_ring.timeline_origin_is_set() &&
             !ul_rx_ring.set_timeline_origin(chunk_start_sample)) {
             LOG_G_ERROR_M(ChannelSim) << "[ChannelSim] failed to establish uplink RX timeline";
@@ -680,14 +861,18 @@ int main(int argc, char** argv) {
 
         // --- Communication RX direct path: tapped-delay-line (LoS + static multipath) ---
         // This is the strong, decodable component the comm receiver synchronizes to.
-        if (enable_comm) {
+        for (auto& ue : ues) {
+            if (ue.fir) {
+                ue.fir->process(ext.data() + L, ue.out.data(), M);
+                continue;
+            }
             for (size_t n = 0; n < M; ++n) {
                 cf acc(0.0f, 0.0f);
-                for (const auto& tap : taps) {
+                for (const auto& tap : ue.taps) {
                     const size_t d = static_cast<size_t>(tap.delay_samples);
                     acc += tap.gain * ext[L + n - d];
                 }
-                out_comm[n] = acc;
+                ue.out[n] = acc;
             }
         }
 
@@ -725,42 +910,45 @@ int main(int argc, char** argv) {
         }
 
         // --- Bistatic target reflections onto the comm channel (single antenna, no steering) ---
-        if (enable_comm) {
-            for (auto& tg : bistatic_targets) {
+        std::vector<size_t> comm_counts(ues.size(), M);
+        for (size_t ui = 0; ui < ues.size(); ++ui) {
+            UeChannel& ue = ues[ui];
+            for (auto& tg : ue.bistatic_targets) {
                 cf phasor = tg.doppler_phasor;
                 const size_t d = static_cast<size_t>(tg.delay_samples);
                 for (size_t n = 0; n < M; ++n) {
-                    out_comm[n] += tg.gain * ext[L + n - d] * phasor; // gain * x[n-d] * doppler
+                    ue.out[n] += tg.gain * ext[L + n - d] * phasor; // gain * x[n-d] * doppler
                     phasor *= tg.doppler_step;
                 }
                 const float mag = std::abs(phasor);
                 if (mag > 1e-6f) phasor /= mag;
                 tg.doppler_phasor = phasor;
             }
-        }
 
-        size_t comm_count = M;
-        if (enable_comm && sro_on) {
-            comm_sro_resampler.append(out_comm.data(), M);
-            comm_sro_resampler.produce(comm_sro_out);
-            comm_count = comm_sro_out.size();
-            if (out_comm.size() < comm_count) {
-                out_comm.resize(comm_count);
+            size_t comm_count = M;
+            if (sro_on) {
+                ue.sro->append(ue.out.data(), M);
+                ue.sro->produce(ue.sro_out);
+                comm_count = ue.sro_out.size();
+                if (ue.out.size() < comm_count) {
+                    ue.out.resize(comm_count);
+                }
+                std::copy(ue.sro_out.begin(), ue.sro_out.end(), ue.out.begin());
             }
-            std::copy(comm_sro_out.begin(), comm_sro_out.end(), out_comm.begin());
-        }
+            comm_counts[ui] = comm_count;
 
-        // --- Apply RX carrier frequency offset to the whole comm signal ---
-        if (enable_comm) {
-            const double rx_freq_correction_hz = ctrl.comm_rx_freq_correction_hz();
-            const double residual_cfo_hz = sim.cfo_hz + rx_freq_correction_hz;
-            if (!have_logged_rx_freq_correction ||
-                std::abs(rx_freq_correction_hz - last_logged_rx_freq_correction_hz) > 1e-3) {
-                LOG_G_INFO_M(ChannelSim) << "[ChannelSim] comm RX frequency correction="
+            // --- Apply this UE's residual carrier frequency offset ---
+            const double rx_freq_correction_hz = ue.slot >= 0
+                ? ctrl.ue_rx_freq_correction_hz(static_cast<size_t>(ue.slot))
+                : ctrl.comm_rx_freq_correction_hz();
+            const double residual_cfo_hz = ue.cfo_hz + rx_freq_correction_hz;
+            if (!ue.have_logged_correction ||
+                std::abs(rx_freq_correction_hz - ue.last_logged_correction_hz) > 1e-3) {
+                LOG_G_INFO_M(ChannelSim) << "[ChannelSim] " << ue.name << " RX frequency correction="
                              << rx_freq_correction_hz << " Hz, residual CFO="
                              << residual_cfo_hz << " Hz";
-                last_logged_rx_freq_correction_hz = rx_freq_correction_hz;
-                have_logged_rx_freq_correction = true;
+                ue.last_logged_correction_hz = rx_freq_correction_hz;
+                ue.have_logged_correction = true;
             }
             const double cfo_dphi =
                 (comm_rx_sample_rate > 0.0) ? (kTwoPi * residual_cfo_hz / comm_rx_sample_rate) : 0.0;
@@ -768,11 +956,11 @@ int main(int argc, char** argv) {
                 static_cast<float>(std::cos(cfo_dphi)),
                 static_cast<float>(std::sin(cfo_dphi)));
             for (size_t n = 0; n < comm_count; ++n) {
-                out_comm[n] *= downlink_cfo_phasor;
-                downlink_cfo_phasor *= cfo_step;
+                ue.out[n] *= ue.cfo_phasor;
+                ue.cfo_phasor *= cfo_step;
             }
-            const float mag = std::abs(downlink_cfo_phasor);
-            if (mag > 1e-6f) downlink_cfo_phasor /= mag;
+            const float mag = std::abs(ue.cfo_phasor);
+            if (mag > 1e-6f) ue.cfo_phasor /= mag;
         }
 
         // --- Target SNR scaling ---
@@ -793,8 +981,9 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < num_channels; ++k) {
                 (void)scale_clean_signal_to_snr(out_sens[k].data(), M, target_snr_db, noise_power);
             }
-            if (enable_comm) {
-                (void)scale_clean_signal_to_snr(out_comm.data(), comm_count, target_snr_db, noise_power);
+            for (size_t ui = 0; ui < ues.size(); ++ui) {
+                (void)scale_clean_signal_to_snr(ues[ui].out.data(), comm_counts[ui],
+                                                target_snr_db + ues[ui].snr_offset_db, noise_power);
             }
         }
 
@@ -804,8 +993,8 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < num_channels; ++k) {
                 noise_gen.add(out_sens[k].data(), M, sigma);
             }
-            if (enable_comm) {
-                noise_gen.add(out_comm.data(), comm_count, sigma);
+            for (size_t ui = 0; ui < ues.size(); ++ui) {
+                noise_gen.add(ues[ui].out.data(), comm_counts[ui], sigma);
             }
         }
 
@@ -825,8 +1014,8 @@ int main(int argc, char** argv) {
         for (size_t k = 0; k < num_channels; ++k) {
             sens_rings[k]->push_block(out_sens[k].data(), M, running);
         }
-        if (enable_comm) {
-            comm_ring.push_block(out_comm.data(), comm_count, running);
+        for (size_t ui = 0; ui < ues.size(); ++ui) {
+            ues[ui].ring->push_block(ues[ui].out.data(), comm_counts[ui], running);
         }
 
         // --- Uplink (UE->BS): drain UE TX for this BS-clock chunk, apply TDL + AWGN ---
@@ -988,7 +1177,7 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     tx_ring.unlink();
     for (auto& r : sens_rings) r->unlink();
-    comm_ring.unlink();
+    for (auto& ue : ues) ue.ring->unlink();
     if (enable_uplink) {
         ul_tx_ring.unlink();
         ul_rx_ring.unlink();
