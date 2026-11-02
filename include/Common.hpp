@@ -218,6 +218,24 @@ struct SimMultipathTap {
 };
 
 /**
+ * @brief One simulated UE in a multi-UE ChannelSimulator run (simulation.ues[]).
+ *
+ * The downlink channel of UE i is `comm_multipath_taps` (the shared list when
+ * empty), plus the bistatic scatterers, plus an optional frequency response from
+ * `channel_file` (fft_size little-endian complex<float> values, FFT-bin order)
+ * applied by overlap-save convolution with its cyclic-prefix-length impulse
+ * response. `snr_offset_db` is added to the hub's target SNR for this UE only,
+ * so one runtime SNR command still sweeps every UE together.
+ */
+struct SimUeConfig {
+    std::string name = "";                      // Label for logs (default "ue<i>")
+    double snr_offset_db = 0.0;                 // Added to target_snr_db for this UE
+    double cfo_hz = std::numeric_limits<double>::quiet_NaN(); // Per-UE BS->UE CFO; NaN = simulation.cfo_hz
+    std::string channel_file = "";              // Optional per-UE frequency response H[k]
+    std::vector<SimMultipathTap> comm_multipath_taps; // Per-UE TDL taps; empty = shared list
+};
+
+/**
  * @brief Channel simulator parameters (used when radio_backend == "sim").
  *
  * Shared by the BS, UE, and the standalone ChannelSimulator hub.
@@ -253,6 +271,12 @@ struct SimConfig {
     std::vector<SimTarget> bistatic_targets;   // Scatterers for the bistatic (comm) channel; empty => reuse `targets`
     std::string steering_override_file = "";   // Optional [num_targets x num_rx_channels] complex<float> matrix
     size_t ring_capacity_samples = 1u << 22;   // Per-stream shm ring capacity (complex<float> samples)
+    // OFDMA / multi-UE simulation. When `ues` is non-empty the hub produces one
+    // communication RX ring per entry ("rx.comm.<i>") with its own channel, CFO
+    // and SNR offset; a UE picks its ring with `ue_index`. Empty keeps the
+    // single-UE "rx.comm" behaviour.
+    std::vector<SimUeConfig> ues;
+    int ue_index = -1;                          // UE side: which `ues` entry this process is (-1 = single-UE)
 };
 
 /**
@@ -1425,6 +1449,12 @@ struct SensingConfig {
     bool bistatic_phase_reference = false; // LoS phase-only reference before MTI
     float phase_reference_min_coherence = 0.05f;
     std::string delay_correction_mode = kSensingDelayCorrectionModeLosTracking; // los_tracking or ertm_absolute
+    // UE bistatic sensing reference on data subcarriers: "all" re-modulates every
+    // non-pilot subcarrier by hard decision (legacy), "own" only this UE's OFDMA
+    // subcarriers (other users' data is zeroed, i.e. excluded), "pilots" zeroes
+    // all data so only the comb pilots, mid-frame pilots and sync symbol remain.
+    // Empty = "own" when OFDMA is enabled, "all" otherwise.
+    std::string bistatic_data_mode = "";
 };
 
 struct RadioConfig {
@@ -1548,6 +1578,47 @@ struct ResourcePreviewConfig {
 };
 
 /**
+ * @brief OFDMA: several users, each on its own set of data subcarriers.
+ *
+ * The downlink payload grid (see DataResourceGridLayout) is split by subcarrier
+ * among `num_users` users for every data symbol of the frame. The sync symbol,
+ * mid-frame pilot symbols, comb pilots (`pilot_positions`) and sensing-pilot
+ * blocks stay shared and unchanged. Schemes are defined over the "data
+ * subcarriers": the non-pilot FFT bins in ascending *frequency* order (bins
+ * fft_size/2..fft_size-1, then 0..fft_size/2-1), so clusters and blocks are
+ * contiguous in frequency.
+ *
+ *   interleaved  user u owns every num_users-th data subcarrier, starting at u
+ *   clusters     clusters of cluster_size adjacent data subcarriers, round robin
+ *   blocks       one contiguous block per user (clusters with N_data/num_users)
+ *   explicit     user_subcarriers[u] lists FFT-bin indices (or mask_file holds
+ *                a YAML document with a top-level `user_subcarriers`)
+ *
+ * Data subcarriers owned by nobody keep the legacy filler (random symbols).
+ * The BS builds one payload layout per user (user_id = -1 selects the union for
+ * its templates); a UE builds the layout of its own `user_id`.
+ */
+inline constexpr const char* kOfdmaSchemeInterleaved = "interleaved";
+inline constexpr const char* kOfdmaSchemeClusters = "clusters";
+inline constexpr const char* kOfdmaSchemeBlocks = "blocks";
+inline constexpr const char* kOfdmaSchemeExplicit = "explicit";
+
+struct OfdmaUserConfig {
+    int udp_input_port = -1;                    // BS: UDP payload input for this user (-1 = udp_input_port + 10*u)
+};
+
+struct OfdmaConfig {
+    bool enabled = false;
+    size_t num_users = 1;
+    std::string scheme = kOfdmaSchemeInterleaved;
+    size_t cluster_size = 1;                    // clusters: adjacent data subcarriers per unit
+    std::vector<std::vector<size_t>> user_subcarriers; // explicit: FFT-bin indices per user
+    std::string mask_file = "";                 // explicit: file holding user_subcarriers
+    int user_id = -1;                           // UE: this user's index; BS: -1 (union of all users)
+    std::vector<OfdmaUserConfig> users;         // BS: per-user inputs (missing entries use defaults)
+};
+
+/**
  * @brief Typed runtime configuration.
  *
  * Mirrors the sectioned YAML layout. YAML is parsed once into this structure;
@@ -1612,6 +1683,7 @@ struct Config {
     CpuCoresConfig cpu_cores;
     LoggingConfig logging;
     ResourcePreviewConfig resource_preview;
+    OfdmaConfig ofdma;
     LdpcDecodeConfig ldpc;
 
     // Calculate total samples per frame
@@ -1916,6 +1988,7 @@ inline Config make_uplink_config(const Config& cfg) {
     ul.sensing.mask_blocks.clear();
     ul.resource_preview.data_resource_blocks.clear();
     ul.resource_preview.data_resource_blocks_configured = false;
+    ul.ofdma = OfdmaConfig{};                 // OFDMA is downlink-only in this version
     // The uplink does not run sensing; keep sensing_symbol_num consistent.
     ul.ofdm.sensing_symbol_num = ul_syms;
     return ul;
@@ -2532,9 +2605,128 @@ inline void normalize_sensing_view_bins(Config& cfg, const char* context_name) {
     }
 }
 
+/**
+ * @brief Per-user subcarrier ownership for OFDMA: masks[u][k] = 1 when user u
+ *        owns FFT bin k. Validates the configuration and throws on error.
+ *
+ * Data subcarriers are the non-pilot bins in ascending frequency order (second
+ * half of the FFT first). Explicit lists are validated against pilots, range and
+ * overlap. Returns an empty vector when OFDMA is disabled.
+ */
+inline std::vector<std::vector<uint8_t>> build_ofdma_user_subcarrier_masks(const Config& cfg) {
+    std::vector<std::vector<uint8_t>> masks;
+    const OfdmaConfig& o = cfg.ofdma;
+    if (!o.enabled) {
+        return masks;
+    }
+    const size_t n = cfg.ofdm.fft_size;
+    if (o.num_users == 0) {
+        throw std::runtime_error("ofdma.num_users must be at least 1.");
+    }
+    if (o.user_id >= static_cast<int>(o.num_users)) {
+        throw std::runtime_error("ofdma.user_id=" + std::to_string(o.user_id) +
+                                 " is out of range for num_users=" + std::to_string(o.num_users) + '.');
+    }
+    std::vector<uint8_t> pilot(n, 0);
+    for (auto pos : cfg.ofdm.pilot_positions) {
+        if (pos < n) pilot[pos] = 1;
+    }
+    // Data subcarriers in frequency order: negative frequencies (bins n/2..n-1) first.
+    std::vector<size_t> data;
+    data.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t k = (i + n / 2) % n;
+        if (pilot[k] == 0) data.push_back(k);
+    }
+    masks.assign(o.num_users, std::vector<uint8_t>(n, 0));
+    if (o.scheme == kOfdmaSchemeExplicit) {
+        if (o.user_subcarriers.size() != o.num_users) {
+            throw std::runtime_error("ofdma.user_subcarriers must have exactly num_users=" +
+                                     std::to_string(o.num_users) + " lists (got " +
+                                     std::to_string(o.user_subcarriers.size()) + ").");
+        }
+        std::vector<int> owner(n, -1);
+        for (size_t u = 0; u < o.num_users; ++u) {
+            for (size_t k : o.user_subcarriers[u]) {
+                if (k >= n) {
+                    throw std::runtime_error("ofdma.user_subcarriers[" + std::to_string(u) + "] contains bin " +
+                                             std::to_string(k) + " >= fft_size.");
+                }
+                if (pilot[k] != 0) {
+                    throw std::runtime_error("ofdma.user_subcarriers[" + std::to_string(u) + "] contains pilot bin " +
+                                             std::to_string(k) + '.');
+                }
+                if (owner[k] >= 0 && owner[k] != static_cast<int>(u)) {
+                    throw std::runtime_error("ofdma: bin " + std::to_string(k) + " is assigned to users " +
+                                             std::to_string(owner[k]) + " and " + std::to_string(u) + '.');
+                }
+                owner[k] = static_cast<int>(u);
+                masks[u][k] = 1;
+            }
+        }
+    } else {
+        size_t cluster = 1;
+        if (o.scheme == kOfdmaSchemeInterleaved) {
+            cluster = 1;
+        } else if (o.scheme == kOfdmaSchemeClusters) {
+            if (o.cluster_size == 0) {
+                throw std::runtime_error("ofdma.cluster_size must be at least 1.");
+            }
+            cluster = o.cluster_size;
+        } else if (o.scheme == kOfdmaSchemeBlocks) {
+            cluster = std::max<size_t>(1, data.size() / o.num_users);
+        } else {
+            throw std::runtime_error("ofdma.scheme must be interleaved, clusters, blocks or explicit (got '" +
+                                     o.scheme + "').");
+        }
+        // Equal shares: every user gets the same number of whole clusters; the
+        // remainder (at the top of the band) stays unassigned filler.
+        const size_t clusters_total = data.size() / cluster;
+        const size_t clusters_used = clusters_total / o.num_users * o.num_users;
+        for (size_t c = 0; c < clusters_used; ++c) {
+            const size_t u = c % o.num_users;
+            for (size_t j = 0; j < cluster; ++j) {
+                masks[u][data[c * cluster + j]] = 1;
+            }
+        }
+    }
+    for (size_t u = 0; u < o.num_users; ++u) {
+        if (std::count(masks[u].begin(), masks[u].end(), 1) == 0) {
+            throw std::runtime_error("ofdma: user " + std::to_string(u) + " owns no subcarriers.");
+        }
+    }
+    return masks;
+}
+
+/** Subcarrier selector for the configured role: user_id >= 0 picks that user, -1 the union. */
+inline std::vector<uint8_t> ofdma_selected_subcarrier_mask(const Config& cfg) {
+    const auto masks = build_ofdma_user_subcarrier_masks(cfg);
+    std::vector<uint8_t> sel(cfg.ofdm.fft_size, 1);
+    if (masks.empty()) {
+        return sel;
+    }
+    std::fill(sel.begin(), sel.end(), 0);
+    if (cfg.ofdma.user_id >= 0) {
+        return masks[static_cast<size_t>(cfg.ofdma.user_id)];
+    }
+    for (const auto& m : masks) {
+        for (size_t k = 0; k < sel.size(); ++k) sel[k] |= m[k];
+    }
+    return sel;
+}
+
+inline DataResourceGridLayout build_data_resource_grid_layout(const Config& cfg, bool log_warnings = false);
+
+/** Payload layout of one OFDMA user (the BS builds one per user). */
+inline DataResourceGridLayout build_data_resource_grid_layout_for_user(const Config& cfg, int user_id) {
+    Config user_cfg = cfg;
+    user_cfg.ofdma.user_id = user_id;
+    return build_data_resource_grid_layout(user_cfg, false);
+}
+
 inline DataResourceGridLayout build_data_resource_grid_layout(
     const Config& cfg,
-    bool log_warnings = false)
+    bool log_warnings)
 {
     if (cfg.ofdm.num_symbols == 0) {
         throw std::runtime_error("num_symbols=0 is invalid for data-resource layout.");
@@ -2746,6 +2938,22 @@ inline DataResourceGridLayout build_data_resource_grid_layout(
         }
     }
 
+    // OFDMA: keep only the subcarriers owned by the selected user (or by any user
+    // for the BS union). Sync, mid-frame pilots, comb pilots and sensing-pilot
+    // RE are not payload and are unaffected.
+    if (cfg.ofdma.enabled) {
+        const std::vector<uint8_t> owned = ofdma_selected_subcarrier_mask(cfg);
+        for (size_t data_sym = 0; data_sym < layout.data_symbol_count; ++data_sym) {
+            const size_t base = layout.non_pilot_offsets[data_sym];
+            for (size_t di = 0; di < layout.num_non_pilot_subcarriers; ++di) {
+                const size_t k = static_cast<size_t>(layout.non_pilot_subcarrier_indices[di]);
+                if (owned[k] == 0) {
+                    layout.payload_mask[base + di] = 0;
+                }
+            }
+        }
+    }
+
     for (size_t flat_idx = 0; flat_idx < layout.non_pilot_re_count; ++flat_idx) {
         if (layout.sensing_pilot_mask[flat_idx] == 0) {
             continue;
@@ -2936,6 +3144,26 @@ inline void load_simulation_config(const YAML::Node& config, Config& cfg) {
         }
         if (sim_node["bistatic_targets"] && sim_node["bistatic_targets"].IsSequence()) {
             load_target_seq(sim_node["bistatic_targets"], sim.bistatic_targets);
+        }
+        if (sim_node["ue_index"]) sim.ue_index = sim_node["ue_index"].as<int>();
+        if (sim_node["ues"] && sim_node["ues"].IsSequence()) {
+            sim.ues.clear();
+            for (const auto& node : sim_node["ues"]) {
+                SimUeConfig ue;
+                if (node["name"]) ue.name = node["name"].as<std::string>();
+                if (node["snr_offset_db"]) ue.snr_offset_db = node["snr_offset_db"].as<double>();
+                if (node["cfo_hz"]) ue.cfo_hz = node["cfo_hz"].as<double>();
+                if (node["channel_file"]) ue.channel_file = node["channel_file"].as<std::string>();
+                if (node["comm_multipath_taps"] && node["comm_multipath_taps"].IsSequence()) {
+                    load_tap_seq(node["comm_multipath_taps"], ue.comm_multipath_taps);
+                }
+                if (ue.name.empty()) ue.name = "ue" + std::to_string(sim.ues.size());
+                sim.ues.push_back(ue);
+            }
+        }
+        if (sim.ue_index >= static_cast<int>(sim.ues.size()) && !sim.ues.empty()) {
+            throw std::runtime_error("simulation.ue_index=" + std::to_string(sim.ue_index) +
+                                     " is out of range for simulation.ues (" + std::to_string(sim.ues.size()) + ").");
         }
     }
 }
@@ -3477,6 +3705,86 @@ inline bool load_data_resource_blocks_from_yaml(Config& cfg, const YAML::Node& c
     return true;
 }
 
+/**
+ * Parse the `ofdma:` section (shared schema for BS and UE; see OfdmaConfig).
+ * `mask_file` is resolved here into user_subcarriers so the layout builder
+ * never touches the file system. The UE must give user_id; the BS ignores it.
+ */
+inline bool load_ofdma_config_from_yaml(Config& cfg, const YAML::Node& config, const char* context_name, bool is_ue) {
+    const YAML::Node o = config["ofdma"];
+    if (!o || !o.IsMap()) {
+        return true;
+    }
+    OfdmaConfig& out = cfg.ofdma;
+    if (o["enabled"]) out.enabled = o["enabled"].as<bool>();
+    if (o["num_users"]) out.num_users = o["num_users"].as<size_t>();
+    if (o["scheme"]) out.scheme = o["scheme"].as<std::string>();
+    if (o["cluster_size"]) out.cluster_size = o["cluster_size"].as<size_t>();
+    if (o["mask_file"]) out.mask_file = o["mask_file"].as<std::string>();
+    if (o["user_subcarriers"] && o["user_subcarriers"].IsSequence()) {
+        out.user_subcarriers.clear();
+        for (const auto& lst : o["user_subcarriers"]) {
+            out.user_subcarriers.push_back(lst.as<std::vector<size_t>>());
+        }
+    }
+    if (o["users"] && o["users"].IsSequence()) {
+        out.users.clear();
+        for (const auto& node : o["users"]) {
+            OfdmaUserConfig u;
+            if (node["udp_input_port"]) u.udp_input_port = node["udp_input_port"].as<int>();
+            out.users.push_back(u);
+        }
+    }
+    if (is_ue) {
+        if (o["user_id"]) out.user_id = o["user_id"].as<int>();
+        if (out.enabled && out.user_id < 0) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled requires ofdma.user_id (0..num_users-1).";
+            return false;
+        }
+    } else {
+        out.user_id = -1;
+    }
+    if (out.enabled && out.scheme == kOfdmaSchemeExplicit && !out.mask_file.empty()) {
+        try {
+            const YAML::Node mf = YAML::LoadFile(out.mask_file);
+            const YAML::Node lists = mf["user_subcarriers"];
+            if (!lists || !lists.IsSequence()) {
+                LOG_G_ERROR_M(Config) << context_name << " ofdma.mask_file '" << out.mask_file
+                              << "' has no top-level user_subcarriers list.";
+                return false;
+            }
+            out.user_subcarriers.clear();
+            for (const auto& lst : lists) {
+                out.user_subcarriers.push_back(lst.as<std::vector<size_t>>());
+            }
+        } catch (const std::exception& e) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.mask_file '" << out.mask_file
+                          << "' could not be read: " << e.what();
+            return false;
+        }
+    }
+    if (out.enabled) {
+        if (cfg.network_output.arq_enabled || cfg.uplink_arq.arq_enabled) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled does not support ARQ in this version.";
+            return false;
+        }
+        if (cfg.measurement.measurement_enable) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled does not support measurement mode in this version.";
+            return false;
+        }
+        if (cfg.uplink.ertm_to_enable) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled does not support eRTM payload injection in this version.";
+            return false;
+        }
+        if (cfg.modulation.scheme != ModulationScheme::Qpsk) {
+            LOG_G_ERROR_M(Config) << context_name << " ofdma.enabled requires modulation.scheme QPSK in this version.";
+            return false;
+        }
+        (void)build_ofdma_user_subcarrier_masks(cfg);   // validate now, with a clear message
+    }
+    return true;
+}
+
 inline bool load_sensing_mask_blocks_from_yaml(Config& cfg, const YAML::Node& config, const char* context_name) {
     return load_resource_blocks_from_yaml(
         cfg.sensing.mask_blocks,
@@ -3839,6 +4147,9 @@ inline bool load_bs_config_from_yaml(Config& cfg, const std::string& filepath) {
                 cfg, resource_preview, "BS config")) {
             return false;
         }
+        if (!config_detail::load_ofdma_config_from_yaml(cfg, config, "BS config", false)) {
+            return false;
+        }
         if (!config_detail::load_sensing_mask_blocks_from_yaml(
                 cfg, resource_preview, "BS config")) {
             return false;
@@ -4180,6 +4491,13 @@ inline bool load_ue_config_from_yaml(Config& cfg, const std::string& filepath) {
             cuda, "cuda_ldpc_cross_frame_flush_us", cfg.cuda.cuda_ldpc_cross_frame_flush_us);
 
         config_detail::load_value(sensing, "bi_enabled", cfg.sensing.bi_enabled);
+        config_detail::load_value(sensing, "bistatic_data_mode", cfg.sensing.bistatic_data_mode);
+        if (!cfg.sensing.bistatic_data_mode.empty() &&
+            cfg.sensing.bistatic_data_mode != "all" &&
+            cfg.sensing.bistatic_data_mode != "own" &&
+            cfg.sensing.bistatic_data_mode != "pilots") {
+            throw std::runtime_error("sensing.bistatic_data_mode must be all, own or pilots");
+        }
         config_detail::load_value(sensing, "bistatic_phase_reference", cfg.sensing.bistatic_phase_reference);
         config_detail::load_value(sensing, "phase_reference_min_coherence", cfg.sensing.phase_reference_min_coherence);
         uint32_t coherence_bits;
@@ -4505,6 +4823,9 @@ inline bool load_ue_config_from_yaml(Config& cfg, const std::string& filepath) {
 
         if (!config_detail::load_data_resource_blocks_from_yaml(
                 cfg, resource_preview, "UE config")) {
+            return false;
+        }
+        if (!config_detail::load_ofdma_config_from_yaml(cfg, config, "UE config", true)) {
             return false;
         }
         if (!config_detail::load_sensing_mask_blocks_from_yaml(
