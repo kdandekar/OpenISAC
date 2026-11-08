@@ -54,6 +54,15 @@ struct PpsTimeAlignmentResult {
  * next edge. It then polls until every device time counter is observed to reset
  * at that edge and verifies that the resulting device-time values agree.
  *
+ * What the last-PPS register reports on the load edge differs by device: an
+ * X310 reports the loaded time (0), while a USRP2/N210 latches the time just
+ * before the load (the old device time) and reports 0-based values only from
+ * the next edge (1.0, 2.0, ...). So a device passes when its time counter was
+ * seen to reset and either its last PPS reads 0 or its time is still within
+ * the first second after the load: the reset can only come from the armed
+ * load, which happens on a PPS edge. Observed on N210r4 radios with an
+ * OctoClock, 2026-11-07 (openisac-grid E6).
+ *
  * @param targets Devices to align; duplicate pointers are collapsed while
  *                retaining their first label. Distinct devices must resolve
  *                to external or gpsdo so they share a common PPS epoch.
@@ -197,9 +206,43 @@ inline PpsTimeAlignmentResult align_device_times_to_next_pps(
 
         const double max_skew_s = std::chrono::duration<double>(
             options.max_device_time_skew).count();
-        if (all_reset && all_target_pps_zero &&
+        // N210: last_pps holds the pre-load time on the load edge (see above),
+        // so a reset device still in its first second also counts as loaded.
+        const bool all_loaded = all_target_pps_zero ||
+            (min_now_s >= 0.0 && max_now_s < 1.0);
+        if (all_reset && all_loaded &&
             max_now_s - min_now_s <= max_skew_s) {
-            return current;
+            if (all_target_pps_zero) {
+                return current;
+            }
+            // Pre-load latch: wait for the first edge after the load, so that
+            // later time_last_pps() readers (BS/UE PPS anchors) see 0-based
+            // values rather than the old device time.
+            const auto settle_deadline =
+                std::chrono::steady_clock::now() + options.edge_timeout;
+            while (true) {
+                bool settled = true;
+                for (size_t i = 0; i < unique.size(); ++i) {
+                    const int64_t last = unique[i].device->time_last_pps()
+                        .to_ticks(tick_rates[i]);
+                    const int64_t now = unique[i].device->time_now()
+                        .to_ticks(tick_rates[i]);
+                    current.devices[i].last_pps_ticks = last;
+                    current.devices[i].now_ticks = now;
+                    settled = settled && last >= 0 && last <= now;
+                }
+                if (settled) {
+                    return current;
+                }
+                if (std::chrono::steady_clock::now() >= settle_deadline) {
+                    throw std::runtime_error(
+                        "timed out waiting for the first PPS edge after "
+                        "alignment");
+                }
+                std::this_thread::sleep_for(
+                    std::max(options.poll_interval,
+                             std::chrono::milliseconds(1)));
+            }
         }
         last_result = std::move(current);
         if (options.poll_interval.count() <= 0) {
