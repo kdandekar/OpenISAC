@@ -28,6 +28,7 @@
 #include "OFDMCore.hpp"
 #include "SensingChannel.hpp"
 #include "RadioBackend.hpp"
+#include "OfdmaEncodeWeights.hpp"
 #include <functional>
 #include <unordered_map>
 #include <memory>
@@ -2083,20 +2084,19 @@ private:
                          << ", constellation order " << us->modulation.order() << ", code bits " << us->rate.code_bits() << "/1008";
             _ofdma_users.push_back(std::move(us));
         }
-        // Encoder fairness: serve each user in proportion to the bits its share carries per
-        // frame, so a user with more subcarriers or a denser constellation is not held to the
-        // smallest user's packet rate when the single encoder thread is the bottleneck.
-        double min_bits = 0.0;
-        std::vector<double> bits(_ofdma_users.size());
-        for (size_t u = 0; u < _ofdma_users.size(); ++u) {
-            const auto& us = *_ofdma_users[u];
-            bits[u] = std::log2(static_cast<double>(us.modulation.order())) *
-                      static_cast<double>(us.rate.code_bits()) / 1008.0 *
-                      static_cast<double>(us.layout.payload_re_count);
-            min_bits = (u == 0) ? bits[u] : std::min(min_bits, bits[u]);
+        // Encoder fairness: serve each user in proportion to the information bits its share carries
+        // per frame, so a user with more subcarriers, a denser constellation or a higher code rate is
+        // not held to the smallest user's packet rate when the single encoder thread is the bottleneck.
+        std::vector<ofdma::EncodeLoad> loads;
+        for (const auto& up : _ofdma_users) {
+            loads.push_back({std::log2(static_cast<double>(up->modulation.order())), up->rate.code_bits(),
+                             up->layout.payload_re_count});
         }
+        const auto weights = ofdma::encode_weights(loads);
         for (size_t u = 0; u < _ofdma_users.size(); ++u) {
-            _ofdma_users[u]->encode_weight = static_cast<size_t>(std::max(1.0, std::round(bits[u] / std::max(1.0, min_bits))));
+            _ofdma_users[u]->encode_weight = weights[u];
+            LOG_G_INFO_M(Config) << "[OFDMA] user " << u << ": encode weight " << weights[u] << " ("
+                         << ofdma::info_bits_per_frame(loads[u]) << " info bits/frame)";
         }
         LOG_G_INFO_M(Config) << "[OFDMA] " << _ofdma_users.size() << " users, scheme '" << _cfg.ofdma.scheme
                      << "', union payload " << _data_resource_layout.payload_re_count << " RE/frame";

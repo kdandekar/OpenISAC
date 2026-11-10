@@ -497,6 +497,12 @@ if(BUILD_TESTING)
     add_test(NAME PpsTimeAlignment COMMAND PpsTimeAlignmentTest)
     set_tests_properties(PpsTimeAlignment PROPERTIES LABELS "cpu;sync" TIMEOUT 60)
 
+    add_executable(OfdmaEncodeWeightsTest tests/ofdma_encode_weights_test.cpp)
+    target_include_directories(OfdmaEncodeWeightsTest PRIVATE ${OPENISAC_INCLUDE_DIR})
+    target_compile_options(OfdmaEncodeWeightsTest PRIVATE ${COMMON_COMPILE_OPTIONS})
+    add_test(NAME OfdmaEncodeWeights COMMAND OfdmaEncodeWeightsTest)
+    set_tests_properties(OfdmaEncodeWeights PROPERTIES LABELS "cpu;ofdma" TIMEOUT 30)
+
     add_executable(SyncPreambleTest tests/sync_preamble_test.cpp ${OPENISAC_SRC_DIR}/AsyncLogger.cpp)
     target_include_directories(SyncPreambleTest PRIVATE
         ${OPENISAC_INCLUDE_DIR} ${FFTW3f_INCLUDE_DIRS} ${OPENISAC_ZMQ_INCLUDE_DIRS}
