@@ -45,9 +45,10 @@ Each BS user entry may also carry its own modulation and LDPC payload rate:
 
 The defaults are the global `modulation.scheme` and `ldpc.code_rate`; the UE of that user sets those
 two global keys to the same values. The Identity SIB and the per-packet control symbols stay QPSK.
-The encoder serves users in proportion to the information bits their share carries per frame
-(bits per symbol x payload REs x 504 / transmitted bits per LDPC block), so a user at 3/4 gets 1.5x
-the packets of a user at 1/2 on the same subcarriers.
+The encoder serves users by deficit round robin in payload bytes, each user's share of bytes in
+proportion to the information bits its share carries per frame (bits per symbol x payload REs x 504 /
+transmitted bits per LDPC block): a user at 3/4 gets 1.5x the bytes of a user at 1/2 on the same
+subcarriers, whatever datagram size each user sends.
 
 Per frame, each user's subcarriers carry that user's Identity SIB followed by whole LDPC packets
 from its UDP input, in the same rank order the single-user link uses, so the UE's frame lock,

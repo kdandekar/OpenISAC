@@ -597,9 +597,9 @@ private:
         DigitalModulation modulation{ModulationScheme::Qpsk};
         LdpcRateMatching rate{};
         std::unique_ptr<Scrambler> scrambler;
-        size_t encode_weight = 1;   // packets per encoder pass, proportional to the user's bits per frame
     };
     std::vector<std::unique_ptr<OfdmaUserStream>> _ofdma_users;
+    std::unique_ptr<ofdma::DeficitRoundRobin> _ofdma_drr;   // encoder share per user, in payload bytes
     // Encode-side redirection for OFDMA (set by the single encode thread before
     // each _encode_and_enqueue_payload call; null = legacy queue/capacity).
     SPSCRingBuffer<AlignedIntVector>* _encode_target_queue = nullptr;
@@ -2092,11 +2092,10 @@ private:
             loads.push_back({std::log2(static_cast<double>(up->modulation.order())), up->rate.code_bits(),
                              up->layout.payload_re_count});
         }
-        const auto weights = ofdma::encode_weights(loads);
+        _ofdma_drr = std::make_unique<ofdma::DeficitRoundRobin>(loads);
         for (size_t u = 0; u < _ofdma_users.size(); ++u) {
-            _ofdma_users[u]->encode_weight = weights[u];
-            LOG_G_INFO_M(Config) << "[OFDMA] user " << u << ": encode weight " << weights[u] << " ("
-                         << ofdma::info_bits_per_frame(loads[u]) << " info bits/frame)";
+            LOG_G_INFO_M(Config) << "[OFDMA] user " << u << ": encoder quantum " << _ofdma_drr->quantum(u)
+                         << " B/pass (" << ofdma::info_bits_per_frame(loads[u]) << " info bits/frame)";
         }
         LOG_G_INFO_M(Config) << "[OFDMA] " << _ofdma_users.size() << " users, scheme '" << _cfg.ofdma.scheme
                      << "', union payload " << _data_resource_layout.payload_re_count << " RE/frame";
@@ -2205,15 +2204,19 @@ private:
         }
     }
 
-    /** OFDMA encoder: round robin over users, each packet into its user's queue. */
+    /** OFDMA encoder: deficit round robin over users (bytes in proportion to each share's information
+     *  bits per frame), each packet into its user's queue. */
     template <typename AccumulateProfile>
     void _udp_encode_proc_ofdma(bool do_latency_profile, AccumulateProfile& accumulate_profile) {
         while (_running.load(std::memory_order_relaxed)) {
             bool did_work = false;
-            for (auto& up : _ofdma_users) {
-              for (size_t n = 0; n < up->encode_weight; ++n) {
+            for (size_t u = 0; u < _ofdma_users.size(); ++u) {
+              auto& up = _ofdma_users[u];
+              _ofdma_drr->begin_turn(u);
+              while (true) {
                 RawUdpPacket* pkt = up->raw->consumer_slot();
-                if (pkt == nullptr) break;
+                if (pkt == nullptr) { _ofdma_drr->idle(u); break; }
+                if (!_ofdma_drr->admit(u, pkt->bytes.size())) break;
                 did_work = true;
                 _encode_target_queue = up->packets.get();
                 _encode_modulation = &up->modulation;
